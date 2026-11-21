@@ -133,13 +133,15 @@ def clean_merged(context: Context, wp_ids: list[str], apply: bool) -> list[dict]
     from .inbox import live_session
     from .t3 import read_json
 
-    by_id = {wp.id: wp for wp in context.main_wps()}
+    main_copies = context.main_wps()
+    by_id = {wp.id: wp for wp in main_copies}
+    merged = context.merged_done_ids(main_copies)
     if unknown := set(wp_ids) - by_id.keys():
         raise ProjectError(f"Unknown work packages: {', '.join(sorted(unknown))}")
     reports = []
     for wp_id in wp_ids or sorted(by_id):
-        if by_id[wp_id].status != "done":
-            reports.append({"wp": wp_id, "state": "protected", "reason": "not done on main"})
+        if wp_id not in merged:
+            reports.append({"wp": wp_id, "state": "protected", "reason": "not merged on main"})
             continue
         claim = NamedMutex(context.project.mutex_name("wp", wp_id))
         if not claim.acquire(blocking=False):

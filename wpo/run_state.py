@@ -9,18 +9,20 @@ indexes also live only in the local ledger.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import shutil
 import time
 import uuid
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from .platform import FileLock, replace_file
+from .platform import FileLock, NamedMutex, pid_alive, replace_file
 
 STATE_FILE = "state.json"
+WRITERS_DIR = ".writers"
 OVERRIDE_KEYS = ("builder", "reviewer", "owns", "lane", "delegate", "mode", "skills", "verify")
 RAW_TRANSCRIPT_SUFFIXES = (".log", ".prompt.md", ".system.md", ".stderr", ".inbox.log", ".resumed.log")
 PRESERVED_RUN_FILES = frozenset({
@@ -53,10 +55,17 @@ def fresh_state() -> dict:
         "reevaluations": [],
         "context_notes": [],
         "overrides": {},
+        "approved_verify": None,
         "pr": None,
+        "pr_delivery": None,
         "legacy_wp_id": None,
+        "migrated_from_wp": False,
         "migrated_merged_on_main": False,
+        "local_ff_merged": False,
+        "local_ff_commit": None,
+        "pending_issue_close": False,
         "worktree": None,
+        "worktree_owner": None,
         "branch": None,
         "updated_at": None,
     }
@@ -188,12 +197,117 @@ def set_pr(run_dir: Path, pr: dict | None) -> dict:
     return update(run_dir, _set)
 
 
-def set_workspace_binding(run_dir: Path, worktree: Path | str | None, branch: str | None) -> dict:
+def set_pr_delivery(run_dir: Path, delivery: dict | None) -> dict:
+    """Stores WPO's immutable PR delivery provenance separately from observed live PR state."""
+    def _set(state: dict) -> None:
+        state["pr_delivery"] = dict(delivery) if delivery is not None else None
+
+    return update(run_dir, _set)
+
+
+def set_approved_verify(run_dir: Path, body_sha256: str | None, commands: Iterable[str] = ()) -> dict:
+    """Binds local authorization of GitHub issue Verify commands to a specific reviewed issue body revision."""
+    def _set(state: dict) -> None:
+        if body_sha256 is None:
+            state["approved_verify"] = None
+        else:
+            state["approved_verify"] = {
+                "body_sha256": str(body_sha256),
+                "commands": [str(cmd).strip() for cmd in commands if str(cmd).strip()],
+                "approved_at": time.time(),
+            }
+
+    return update(run_dir, _set)
+
+
+def set_local_ff_merged(run_dir: Path, commit: str, *, pending_issue_close: bool = True) -> dict:
+    """Records verified local-ff merge completion on `main` for a GitHub-tracked item."""
+    def _set(state: dict) -> None:
+        state["status"] = "done"
+        state["local_ff_merged"] = True
+        state["local_ff_commit"] = str(commit).strip()
+        state["pending_issue_close"] = bool(pending_issue_close)
+
+    return update(run_dir, _set)
+
+
+def clear_pending_issue_close(run_dir: Path) -> dict:
+    return update(run_dir, lambda state: state.__setitem__("pending_issue_close", False))
+
+
+@contextlib.contextmanager
+def ledger_writer(project, kind: str, key: str) -> Iterator[Path | None]:
+    """Registers an active ledger writer lease for its full lifetime, synchronized with the
+    project's ledger cutover mutex so migration cannot cut over mid-run or race new writers."""
+    if not hasattr(project, "mutex_name") or not hasattr(project, "runs_dir"):
+        yield None
+        return
+    safe_key = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in str(key))[:48] or "item"
+    cutover = NamedMutex(project.mutex_name("ledger", "cutover"))
+    lease_path: Path | None = None
+    with cutover:
+        # A11/A55: Reject writers whose in-memory Project predates a migration cutover of tracker
+        # or resolved runs_dir (even when runs_dir was previously None / implicit default).
+        root = getattr(project, "root", None)
+        if isinstance(root, Path):
+            cfg_path = root / ".orchestration" / "config.json"
+            if cfg_path.is_file():
+                try:
+                    from .project import Project, ProjectError
+                    reloaded = Project.locate(
+                        root,
+                        getattr(project, "machine_defaults", None),
+                        getattr(project, "execution_mode", "standalone"),
+                        data_dir=getattr(project, "data_dir", None),
+                    )
+                except (OSError, ValueError, ProjectError):
+                    reloaded = None
+                if reloaded is not None and (
+                    reloaded.tracker != getattr(project, "tracker", reloaded.tracker)
+                    or reloaded._resolve_runs_dir().resolve() != project._resolve_runs_dir().resolve()
+                ):
+                    raise StateError(
+                        "project ledger or tracker configuration changed during migration cutover; reload before continuing"
+                    )
+        writers_dir = project.runs_dir / WRITERS_DIR
+        writers_dir.mkdir(parents=True, exist_ok=True)
+        lease_path = writers_dir / f"{kind}-{safe_key}-{os.getpid()}-{uuid.uuid4().hex[:8]}.json"
+        payload = {"kind": kind, "key": str(key), "pid": os.getpid(), "started_at": time.time()}
+        staging = lease_path.with_name(f".{lease_path.name}.tmp")
+        staging.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+        replace_file(staging, lease_path)
+    try:
+        yield lease_path
+    finally:
+        if lease_path is not None:
+            lease_path.unlink(missing_ok=True)
+
+
+def active_writer_leases(runs_dir: Path) -> list[str]:
+    """Returns descriptions of all live ledger writer leases under `<runs>/.writers/`."""
+    writers_dir = runs_dir / WRITERS_DIR
+    if not writers_dir.is_dir():
+        return []
+    active: list[str] = []
+    for lease_file in sorted(writers_dir.glob("*.json")):
+        try:
+            data = json.loads(lease_file.read_text(encoding="utf-8"))
+            pid = int(data["pid"])
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+        if pid_alive(pid):
+            active.append(f"active {data.get('kind', 'writer')} for {data.get('key', lease_file.stem)} (pid {pid})")
+    return active
+
+
+def set_workspace_binding(run_dir: Path, worktree: Path | str | None, branch: str | None, *, owner: str | None = None) -> dict:
     def _set(state: dict) -> None:
         if worktree is not None:
             state["worktree"] = str(worktree)
         if branch is not None:
             state["branch"] = branch
+        if owner is not None:
+            state["worktree_owner"] = owner
 
     return update(run_dir, _set)
 
@@ -301,10 +415,6 @@ def prune_transcripts(context, older_than_days: float, *, apply: bool = False, i
 
     cutoff = time.time() - (timedelta(days=older_than_days).total_seconds())
     merged = context.merged_done_ids()
-    open_ids = {
-        wp.id for wp in context.effective_wps()
-        if wp.id not in merged and wp.status != "done" and wp.github_state != "CLOSED"
-    }
     runs = context.project.runs_dir
     candidates: list[dict] = []
     skipped_open: list[str] = []
@@ -312,7 +422,8 @@ def prune_transcripts(context, older_than_days: float, *, apply: bool = False, i
         return {"applied": apply, "older_than_days": older_than_days, "candidates": [], "removed_files": 0, "removed_bytes": 0, "skipped_open": []}
 
     for item_dir in sorted(path for path in runs.iterdir() if path.is_dir() and path.name.startswith(("WP-", "GH-"))):
-        if not include_open and item_dir.name in open_ids:
+        # Require positive verified merge evidence before pruning unless `--include-open` is passed.
+        if not include_open and item_dir.name not in merged:
             skipped_open.append(item_dir.name)
             continue
         for root, dirs, files in os.walk(item_dir):
@@ -340,39 +451,67 @@ def prune_transcripts(context, older_than_days: float, *, apply: bool = False, i
                     candidates.append({"path": str(file_path), "bytes": stat_result.st_size, "wp": item_dir.name})
 
     removed_files, removed_bytes = 0, 0
+    skipped_changed: list[str] = []
     if apply:
+        from .usage import SESSION_LOG
         index_path = runs / "usage" / "index.json"
         lock_path = runs / "usage" / INDEX_LOCK_FILE
         lock_path.parent.mkdir(parents=True, exist_ok=True)
-        # Hold the same lock as `usage.load_sessions` across unlinking raw transcripts and marking
-        # them pruned so concurrent usage reports never drop aggregate metrics for pruned files.
+        # Hold the same lock as `usage.load_sessions`, revalidate each session log's current
+        # (size, mtime) against `usage/index.json` so appended/unindexed logs are never lost,
+        # durably mark indexed candidates pruned BEFORE unlinking, then delete.
         with FileLock(lock_path):
-            pruned_keys: set[str] = set()
+            index = None
+            if index_path.is_file():
+                try:
+                    loaded = json.loads(index_path.read_text(encoding="utf-8"))
+                    if isinstance(loaded, dict) and isinstance(loaded.get("logs"), dict):
+                        index = loaded
+                except (OSError, ValueError):
+                    index = None
+
+            validated: list[tuple[dict, Path, str, bool]] = []
             for entry in candidates:
                 path = Path(entry["path"])
                 try:
                     rel = path.relative_to(runs).as_posix()
+                    st = path.stat()
+                except (ValueError, OSError):
+                    continue
+                is_session_log = (
+                    path.parent.name != "view"
+                    and bool(SESSION_LOG.match(path.name))
+                    and SESSION_LOG.match(path.name).group("stem") not in ("worker-process", "integrate", "orchestrator-verify")
+                )
+                if is_session_log:
+                    cached = index["logs"].get(rel) if index is not None else None
+                    if (
+                        not isinstance(cached, dict)
+                        or cached.get("size") != st.st_size
+                        or cached.get("mtime") != st.st_mtime
+                    ):
+                        skipped_changed.append(rel)
+                        continue
+                validated.append((entry, path, rel, is_session_log))
+
+            if validated and index is not None:
+                changed = False
+                for _entry, _path, rel, _is_sess in validated:
+                    if rel in index["logs"] and isinstance(index["logs"][rel], dict) and not index["logs"][rel].get("pruned"):
+                        index["logs"][rel]["pruned"] = True
+                        changed = True
+                if changed:
+                    staging = index_path.with_name(f".{index_path.name}.{uuid.uuid4().hex}.tmp")
+                    staging.write_text(json.dumps(index), encoding="utf-8")
+                    replace_file(staging, index_path)
+
+            for entry, path, _rel, _is_sess in validated:
+                try:
                     path.unlink(missing_ok=True)
-                    pruned_keys.add(rel)
                     removed_files += 1
                     removed_bytes += entry["bytes"]
                 except OSError:
                     continue
-            if pruned_keys and index_path.is_file():
-                try:
-                    index = json.loads(index_path.read_text(encoding="utf-8"))
-                except (OSError, ValueError):
-                    index = None
-                if isinstance(index, dict) and isinstance(index.get("logs"), dict):
-                    changed = False
-                    for key in pruned_keys:
-                        if key in index["logs"] and isinstance(index["logs"][key], dict):
-                            index["logs"][key]["pruned"] = True
-                            changed = True
-                    if changed:
-                        staging = index_path.with_name(f".{index_path.name}.{uuid.uuid4().hex}.tmp")
-                        staging.write_text(json.dumps(index), encoding="utf-8")
-                        replace_file(staging, index_path)
         # Remove now-empty rendered view directories.
         for item_dir in sorted(path for path in runs.iterdir() if path.is_dir()):
             view_dir = item_dir / "view"
@@ -391,6 +530,7 @@ def prune_transcripts(context, older_than_days: float, *, apply: bool = False, i
         "removed_files": removed_files,
         "removed_bytes": removed_bytes,
         "skipped_open": skipped_open,
+        "skipped_changed": skipped_changed,
     }
 
 

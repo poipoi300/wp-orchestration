@@ -8,10 +8,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cached_property
 from pathlib import Path
 
@@ -67,8 +68,9 @@ DEFAULTS: dict = {
     "github": GITHUB_DEFAULTS,
     "wp_dir": "docs/plan/wp",
     "worktrees_root": None,  # default: ../<main checkout name>-worktrees
-    # Run state and private transcripts: repo-relative path, absolute/`~` path, or "external" (under machine data_dir).
-    "runs_dir": ".orchestration/runs",
+    # Run state and private transcripts: null auto-selects "external" for GitHub and ".orchestration/runs" for wp-files;
+    # or set an explicit repo-relative path, absolute/`~` path, or "external" (under machine data_dir).
+    "runs_dir": None,
     "main_branch": "main",
     "branch_prefix": "wp/",
     # The project's agent instructions, relative to the tree. Claude-CLI sessions get it in their
@@ -308,6 +310,7 @@ class Project:
     config: dict
     execution_mode: str = "standalone"
     data_dir: Path = DEFAULT_DATA_DIR
+    machine_defaults: dict = field(default_factory=dict)
 
     @classmethod
     def locate(cls, start: Path | None = None, machine_defaults: dict | None = None, execution_mode: str = "standalone",
@@ -318,13 +321,14 @@ class Project:
             raise ProjectError(f"{config_path} does not exist; copy templates/config.example.json from the skill and adapt it")
         # Every key overrides its default on its own (objects merge per key), so `{}` is all defaults.
         override = json.loads(config_path.read_text(encoding="utf-8"))
-        config = _merge(_merge({**DEFAULTS, "name": root.name}, machine_defaults or {}), override)
-        unknown = (set(override) | set(machine_defaults or {})) - set(DEFAULTS) - {"name", "$comment"}
+        defaults_copy = dict(machine_defaults or {})
+        config = _merge(_merge({**DEFAULTS, "name": root.name}, defaults_copy), override)
+        unknown = (set(override) | set(defaults_copy)) - set(DEFAULTS) - {"name", "$comment"}
         if unknown:
             raise ProjectError(f"{config_path}: unknown keys {sorted(unknown)}")
         cls._validate_tracker_config(config_path, config)
         resolved_data = (data_dir or DEFAULT_DATA_DIR).expanduser()
-        return cls(root, config, execution_mode, resolved_data)
+        return cls(root, config, execution_mode, resolved_data, defaults_copy)
 
     @staticmethod
     def _validate_tracker_config(config_path: Path, config: dict) -> None:
@@ -371,16 +375,42 @@ class Project:
     def github_config(self) -> dict:
         return self.config["github"]
 
-    def external_runs_dir(self) -> Path:
+    def _external_runs_for_key(self, key: str) -> Path:
         slug = re.sub(r"[^A-Za-z0-9._-]+", "-", self.name).strip("-") or "project"
-        digest = hashlib.sha1(str(self.root).lower().encode()).hexdigest()[:12]
+        digest = hashlib.sha1(key.encode()).hexdigest()[:12]
         return self.data_dir.expanduser() / "projects" / f"{slug}-{digest}" / "runs"
 
+    def external_runs_dir(self) -> Path:
+        canonical_root = os.path.normcase(str(self.root.resolve()))
+        canonical = self._external_runs_for_key(canonical_root)
+        # If `canonical` already exists and is explicitly claimed by a different case-distinct POSIX
+        # checkout (e.g. an upgraded pre-A34 directory), isolate this checkout under a distinct key.
+        if canonical.is_dir():
+            owner_file = canonical / "project-root.txt"
+            owner_text = owner_file.read_text(encoding="utf-8").strip() if owner_file.is_file() else None
+            if owner_text is not None and owner_text != canonical_root:
+                return self._external_runs_for_key(f"root:{canonical_root}")
+            return canonical
+        # A44: Preserve pre-upgrade POSIX external ledgers created with lowercased path hashing
+        # when no canonical ledger exists yet and the legacy directory is not claimed by another checkout.
+        if os.name != "nt":
+            for legacy_key in (str(self.root).lower(), str(self.root.resolve()).lower()):
+                legacy = self._external_runs_for_key(legacy_key)
+                if legacy != canonical and legacy.is_dir():
+                    owner_file = legacy / "project-root.txt"
+                    owner_text = owner_file.read_text(encoding="utf-8").strip() if owner_file.is_file() else None
+                    if owner_text is None or owner_text == canonical_root:
+                        return legacy
+        return canonical
+
     def _resolve_runs_dir(self) -> Path:
-        configured = str(self.config["runs_dir"])
-        if configured == "external":
+        configured = self.config["runs_dir"]
+        if configured is None:
+            return self.external_runs_dir() if self.is_github else self.root / ".orchestration/runs"
+        configured_text = str(configured)
+        if configured_text == "external":
             return self.external_runs_dir()
-        expanded = Path(configured).expanduser()
+        expanded = Path(configured_text).expanduser()
         return expanded if expanded.is_absolute() else self.root / expanded
 
     @property
@@ -391,6 +421,13 @@ class Project:
     def runs_dir(self) -> Path:
         directory = self._resolve_runs_dir()
         directory.mkdir(parents=True, exist_ok=True)
+        if self.is_external_ledger:
+            owner_file = directory / "project-root.txt"
+            if not owner_file.exists():
+                try:
+                    owner_file.write_text(os.path.normcase(str(self.root.resolve())) + "\n", encoding="utf-8")
+                except OSError:
+                    pass
         return directory
 
     def wp_run_dir(self, wp_id: str) -> Path:
@@ -441,13 +478,90 @@ class Project:
             return str(bound)
         return f"{self.config['branch_prefix']}{wp_id}"
 
+    def resolve_legacy_wp_id(self, wp_id: str) -> str:
+        """Maps a legacy `WP-XXXX` id to its migrated `GH-N` id when running under the GitHub tracker,
+        enforcing the same repository-bound, unambiguous mapping rules as migration."""
+        if not self.is_github or not wp_id.startswith("WP-"):
+            return wp_id
+        runs = self._resolve_runs_dir()
+        repo = str(self.github_config.get("repo") or "").strip().lower()
+        if not repo:
+            remote = str(self.github_config.get("remote") or "origin")
+            url_res = git(self.root, "remote", "get-url", remote, check=False)
+            if url_res.returncode == 0 and url_res.stdout.strip():
+                from .github import parse_github_repo
+                parsed_repo = parse_github_repo(url_res.stdout)
+                if parsed_repo:
+                    repo = parsed_repo.strip().lower()
+        candidates = [runs / "migration-state.json"]
+        repo_runs = self.root / ".orchestration" / "runs" / "migration-state.json"
+        if repo_runs.resolve() != candidates[0].resolve():
+            candidates.append(repo_runs)
+        for state_path in candidates:
+            if not state_path.is_file():
+                continue
+            try:
+                data = json.loads(state_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if not isinstance(data, dict):
+                continue
+            state_repo = str(data.get("repo") or "").strip().lower()
+            # Reject unbound checkpoints with no repository identity or mismatched repository.
+            if not state_repo or (repo and state_repo != repo):
+                continue
+            id_map = data.get("map")
+            if isinstance(id_map, dict) and wp_id in id_map:
+                try:
+                    return f"GH-{int(id_map[wp_id])}"
+                except (TypeError, ValueError):
+                    pass
+        if runs.is_dir():
+            # Verify ledger-level repository binding (ledger-meta.json or github-cache.json) before
+            # falling back to scanning per-issue state files.
+            ledger_repo: str | None = None
+            for meta_name in ("ledger-meta.json", "github-cache.json"):
+                meta_file = runs / meta_name
+                if not meta_file.is_file():
+                    continue
+                try:
+                    meta_val = str(json.loads(meta_file.read_text(encoding="utf-8")).get("repo") or "").strip().lower()
+                except (OSError, ValueError, AttributeError):
+                    meta_val = ""
+                if meta_val:
+                    if repo and meta_val != repo:
+                        return wp_id
+                    ledger_repo = meta_val
+                    break
+            matches: list[str] = []
+            for state_file in sorted(runs.glob("GH-*/state.json")):
+                try:
+                    data = json.loads(state_file.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    continue
+                if not isinstance(data, dict) or data.get("legacy_wp_id") != wp_id:
+                    continue
+                item_repo = str(
+                    data.get("repo")
+                    or (data.get("pr_delivery") or {}).get("repo")
+                    or ledger_repo
+                    or ""
+                ).strip().lower()
+                # Require positive repository identity matching `repo` (same rule as checkpoints).
+                if not item_repo or (repo and item_repo != repo):
+                    continue
+                matches.append(state_file.parent.name)
+            if len(matches) == 1:
+                return matches[0]
+        return wp_id
+
     @property
     def main_branch(self) -> str:
         return self.config["main_branch"]
 
     def mutex_name(self, kind: str, key: str = "") -> str:
         """A machine-wide mutex name unique to this project (its main checkout path)."""
-        digest = hashlib.sha1(str(self.root).lower().encode()).hexdigest()[:12]
+        digest = hashlib.sha1(os.path.normcase(str(self.root.resolve())).encode()).hexdigest()[:12]
         return f"Global\\wpo-{kind}-{digest}" + (f"-{key}" if key else "")
 
     @property

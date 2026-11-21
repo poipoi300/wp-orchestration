@@ -24,8 +24,8 @@ DELIVERED_DIRECTORY = "delivered"
 LIVE_FILE = "live.json"
 PAUSE_FILE = "pause-requested"
 MESSAGE_PREFIX = "Message from the orchestrator (it arrived while you were working; act on it now):\n\n"
-RUNNING_LINE = re.compile(r"\brunning (WP-[\w.-]+) \(")
-EXIT_LINE = re.compile(r"\b(WP-[\w.-]+) runner exit\b")
+RUNNING_LINE = re.compile(r"\brunning ((?:WP|GH)-[\w.-]+) \(")
+EXIT_LINE = re.compile(r"\b((?:WP|GH)-[\w.-]+) runner exit\b")
 WRAP_UP_MESSAGE = (
     "Wrap up now: the orchestrator is pausing this work package. At the next safe point, finish or revert the edit in "
     "progress so the tree is consistent, then record with `wpo log` exactly what is done, what is half done and what "

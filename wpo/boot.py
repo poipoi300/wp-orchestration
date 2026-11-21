@@ -114,16 +114,17 @@ def _json(value: object) -> bytes:
 
 def _record_allowed(relative: str) -> bool:
     return bool(re.fullmatch(r"supervisor-[\w.-]+\.(?:pid|state)|dashboard\.json|"
-                             r"WP-[\w.-]+/inbox/live\.json|"
-                             r"WP-[\w.-]+/delegate/[a-z0-9][a-z0-9-]{0,47}/(?:spawn\.pid|state\.json)", relative))
+                             r"(?:WP|GH)-[\w.-]+/inbox/live\.json|"
+                             r"(?:WP|GH)-[\w.-]+/delegate/[a-z0-9][a-z0-9-]{0,47}/(?:spawn\.pid|state\.json)", relative))
 
 
 def _changes(root: Path) -> list[dict]:
     records = set(root.glob("supervisor-*.pid")) | set(root.glob("supervisor-*.state"))
     records.add(root / "dashboard.json")
-    records.update(root.glob("WP-*/inbox/live.json"))
-    records.update(root.glob("WP-*/delegate/*/spawn.pid"))
-    records.update(root.glob("WP-*/delegate/*/state.json"))
+    for prefix in ("WP-*", "GH-*"):
+        records.update(root.glob(f"{prefix}/inbox/live.json"))
+        records.update(root.glob(f"{prefix}/delegate/*/spawn.pid"))
+        records.update(root.glob(f"{prefix}/delegate/*/state.json"))
     changes = []
     for record in sorted(records):
         relative = record.relative_to(root).as_posix()
