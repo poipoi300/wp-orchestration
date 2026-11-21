@@ -31,7 +31,7 @@ def cleanup_paths(project: Project, wp_id: str) -> list[Path]:
     """Resolve scoped build paths; reject checkout roots, Git data, links and tracked content."""
     if not project.config["remove_after_merge"]:
         return []
-    if not re.fullmatch(r"WP-[A-Za-z0-9_.-]+", wp_id):
+    if not re.fullmatch(r"(?:WP|GH)-[A-Za-z0-9_.-]+", wp_id):
         raise ProjectError(f"Invalid work-package ID for build cleanup: {wp_id}")
     worktree = project.worktree(wp_id).absolute()
     checkouts = [Path(line.removeprefix("worktree ")).resolve()

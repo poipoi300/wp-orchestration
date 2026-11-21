@@ -458,18 +458,19 @@ def wp_relative(context: Context, wp: wpfile.WorkPackage) -> str:
 
 
 def wp_files(context: Context, wp: wpfile.WorkPackage, tree: Path, reading: list[str]) -> str:
-    """The role's reading from the main checkout (current, like the configuration), then the WP file
-    from the tree (the live copy the session works on)."""
-    return "\n\n".join(part for part in (included_files(context.project.root, reading), included_files(tree, [wp_relative(context, wp)])) if part)
+    """The role's reading from the main checkout (current, like the configuration), then the task
+    specification (WP file in tree, or rendered GitHub issue + local run state)."""
+    return "\n\n".join(part for part in (included_files(context.project.root, reading), context.wp_prompt_text(wp, tree)) if part)
 
 
-def shell_rules(context: Context, access: str, lead: bool) -> str:
+def shell_rules(context: Context, access: str, lead: bool, *, is_github: bool = False) -> str:
     """How a session runs commands: what the sandbox allows, and how a denial is handled."""
     allowed = ", ".join(command_prefixes(access, context.project.config, lead))
+    block_cmd = "`wpo block '<reason>'`" if is_github else "Set 'status: blocked'"
     return (f"- Shell: commands run from the repository root. {SHELL_CHAINING} "
             f"Allowed: {allowed}. Inspect files with Read, Glob and Grep. A denied command that an allowed tool replaces (a shell "
             "read, listing or search: use Read, Glob, Grep) is no blocker, for you or a worker you lead: use the allowed tool and "
-            "go on. Set 'status: blocked' only when the work needs an effect no allowed tool gives, logging which command and why; "
+            f"go on. {block_cmd} only when the work needs an effect no allowed tool gives, logging which command and why; "
             "never reach that effect another way.")
 
 
@@ -479,27 +480,41 @@ def builder_rules(context: Context, wp: wpfile.WorkPackage, lead: bool) -> str:
     fixed = f" It applies the runner's fixers first ({fixers}): formatting they handle needs no work from you." if fixers else ""
     environment = "".join(f"\n  - {line}" for line in context.project.config["environment"])
     environment = f"\n- This machine (known facts; do not spend turns re-discovering them):{environment}" if environment else ""
+    try_it_rule = (
+        f"- Before finishing, record the '## {TRY_IT_SECTION}' instructions with `wpo try-it - <<'EOF'` (a fenced block of the exact\n"
+        f"  commands the user runs from the main checkout once this is merged, and what to look for; or, when nothing can be tried by\n"
+        f"  hand, a line starting '{NOTHING_TO_TRY}' saying why). It goes into the PR body—keep secrets and personal paths out of it."
+        if wp.is_github else
+        f"- Before finishing, fill the '## {TRY_IT_SECTION}' section (add it before '## Handoff' if missing): a fenced block of the exact\n"
+        f"  commands the user runs from the main checkout once this is merged, and what to look for; or, when nothing can be tried by\n"
+        f"  hand, a line starting '{NOTHING_TO_TRY}' saying why."
+    )
+    block_rule = (
+        "- Call `wpo block '<reason>'` only for something outside the task's control (a rule, a missing tool or install, a decision only the\n"
+        "  user can make); hard but in-scope work is not a block. When an over-reading of the Goal is the only obstacle\n"
+        "  and every criterion is met, explain the gap with `wpo log` and run `wpo verify`."
+        if wp.is_github else
+        "- Set 'status: blocked' only for something outside the WP's control (a rule, a missing tool or install, a decision only the\n"
+        "  user can make), logging why; hard but in-scope work is not a block. When an over-reading of the Goal is the only obstacle\n"
+        "  and every criterion is met, explain the gap in the Handoff and run `wpo verify`."
+    )
     return f"""- Record progress with `wpo log '<what was done; what is next; blockers>'` when a step completes, adding `--step N`
   to tick step N, chained with your next command (`wpo log '...' --step 1 && cargo test ...`). Quote the message in single quotes and write no apostrophe in it. It writes the dated Progress log line;
   never edit the Progress log yourself.
-{shell_rules(context, "builder", lead)}
-- Before finishing, fill the '## {TRY_IT_SECTION}' section (add it before '## Handoff' if missing): a fenced block of the exact
-  commands the user runs from the main checkout once this is merged, and what to look for; or, when nothing can be tried by
-  hand, a line starting '{NOTHING_TO_TRY}' saying why.
+{shell_rules(context, "builder", lead, is_github=wp.is_github)}
+{try_it_rule}
 - A criterion's test must be able to fail: it fails on code that breaks the criterion. When a criterion compares with
   behaviour before this WP, record that behaviour from the unchanged code before you edit it and pin the recorded values;
   a test comparing the new code path with itself proves nothing and is rejected in review.
 - When every step and acceptance criterion is done, run `wpo verify`: it checks the Try it section, runs the WP's Verify
   commands and owns check, prints only what failed, and sets the status to review when everything passes. Fix what it
   reports and run it again.{fixed} Do not run the Verify commands, a formatter or a linter yourself just before it: it runs them.
-  Finish in as few calls as you can: write the evidence, Try it and Handoff, then `wpo log '...' && wpo verify`.
+  Finish in as few calls as you can: write the evidence and Try it, then `wpo log '...' && wpo verify`.
 - An exact file in 'owns' does not cover new files beside it: put new tests inline (`#[cfg(test)] mod tests {{ ... }}`) unless
   'owns' has a glob there.
-- Set 'status: blocked' only for something outside the WP's control (a rule, a missing tool or install, a decision only the
-  user can make), logging why; hard but in-scope work is not a block. When an over-reading of the Goal is the only obstacle
-  and every criterion is met, explain the gap in the Handoff and run `wpo verify`.
+{block_rule}
 - After three experiments in a row that teach you nothing new, stop: log what you tried and what you would need, and
-  set 'status: blocked' if nothing else in the WP can proceed. Do not re-reason the same hypothesis. Tune numbers by
+  {"call `wpo block '<reason>'`" if wp.is_github else "set 'status: blocked'"} if nothing else in the WP can proceed. Do not re-reason the same hypothesis. Tune numbers by
   sweeping every parameter over a wide grid in one run (one printed line per point) before changing a design.{environment}"""
 
 
@@ -547,16 +562,28 @@ def builder_prompt(context: Context, wp: wpfile.WorkPackage, tree: Path, round_n
     lead = lead_instructions(context, wp, delegate_tier) if delegate_tier else ""
     continued = (f"\nThe previous builder session of this work package handed off to you ({handoff['why']}). Continue from its handoff; "
                  f"the tree and the Progress log are the record of what it did:\n<handoff>\n{handoff['text']}\n</handoff>\n" if handoff else "")
+    scope_note = (
+        (f"changing only its 'owns' paths ({', '.join(wp.owns)}){shared_files_sentence(config)}" if wp.owns_explicit else f"scoped cleanly to the issue{shared_files_sentence(config)}")
+        + ". Progress, Try it and status live in the local WPO ledger (there is no WP markdown file in git)"
+        if wp.is_github else
+        f"changing only its 'owns' paths, its WP file{shared_files_sentence(config)}"
+    )
+    end_rule = (
+        "You are done when `wpo verify` passes: it is the only way to review, and it sets the status itself. "
+        "If you cannot proceed, run `wpo block '<reason>'`."
+        if wp.is_github else
+        "You are done when `wpo verify` passes: it is the only way to review, and it sets the status itself (never set\n"
+        "'status: review' by hand). If you cannot proceed, set 'status: blocked' and log the reason with `wpo log`."
+    )
     return f"""{files}
 
-You are the builder of work package {wp.id}, whose file is above; its status is already in_progress. Implement it as specified,
-changing only its 'owns' paths, its WP file{shared_files_sentence(config)}. Work already under the owns paths may come from an earlier
+You are the builder of work package {wp.id}, whose specification is above; its status is already in_progress. Implement it as specified,
+{scope_note}. Work already in the tree may come from an earlier
 session: the Progress log says where it stopped. This is builder round {round_number}; a '## {REEVALUATION_SECTION}' section, if any, says
 what changed since earlier rounds.
 {builder_rules(context, wp, delegate_tier is not None)}
 {rules}{continued}{recovery_section(recovery)}{rejected}{lead}
-You are done when `wpo verify` passes: it is the only way to review, and it sets the status itself (never set
-'status: review' by hand). If you cannot proceed, set 'status: blocked' and log the reason with `wpo log`.
+{end_rule}
 """
 
 
@@ -584,6 +611,7 @@ def resume_prompt(context: Context, wp: wpfile.WorkPackage, round_number: int, f
     fixers = ", ".join(fixer.name for fixer in configured_fixers(context.project.config)) or "none"
     from .continuous import prompt as milestone_prompt
     rules = "\n".join(context.project.config["prompt_rules"]) + milestone_prompt(context, wp.id)
+    block_hint = "run `wpo block '<reason>'`" if wp.is_github else "set 'status: blocked' and log the reason with `wpo log`"
     return f"""Builder round {round_number} for work package {wp.id}. You are continuing your own session from the previous round, which did not pass.
 Fix these problems first:
 {feedback}
@@ -595,7 +623,7 @@ Record progress with `wpo log '<message>' [--step N]` (single quotes, no apostro
 acceptance criterion is done, run `wpo verify`.
 {rules}
 You are done when `wpo verify` passes: it is the only way to review, and it sets the status itself (never set
-'status: review' by hand). If you cannot proceed, set 'status: blocked' and log the reason with `wpo log`.
+'status: review' by hand). If you cannot proceed, {block_hint}.
 """
 
 
@@ -670,6 +698,9 @@ This is review {review_number} of {wp.id}: number new findings R{review_number}-
 """
 
 
+REVISION_BLOCK = re.compile(r"```wpo-revision[ \t]*\r?\n(.*?)\r?\n[ \t]*```", re.DOTALL)
+
+
 def evaluation_prompt(context: Context, wp: wpfile.WorkPackage, tree: Path, ledger: RoundLedger, builder_spec: str, run_dir: Path, why: str) -> str:
     """Asks a strong model why a WP is not converging and what the next round should do differently."""
     config = context.project.config
@@ -682,12 +713,23 @@ def evaluation_prompt(context: Context, wp: wpfile.WorkPackage, tree: Path, ledg
                 "(the same kind of precision, invariant, matching rule or behaviour), another patch will not converge: decide 'revise' "
                 "and write the structural direction and an explicit contract (a precision contract, an invariant, an exact rule) into "
                 "the Context note, so the builder builds to it and the reviewer judges against it.\n") if rejections >= 2 else ""
+    revise_guidance = (
+        "- revise: the task specification or local scope needs clarification. Do NOT edit any repository file; include a fenced ```wpo-revision\n"
+        "  JSON block with any of {\"context_note\": \"...\", \"add_owns\": [\"glob\"], \"add_verify\": [\"cmd\"]} that the runner applies to the local ledger.\n"
+        "  Keep the Goal's intent and every acceptance criterion: never weaken a check so that failing work passes."
+        if wp.is_github else
+        f"- revise: the WP file itself is the problem. Edit it: a Context note headed '**Re-evaluation note ({datetime.now():%Y-%m-%d}).**'\n"
+        "  that scopes a finding that over-reads the Goal, reorders the Steps into smaller ones, or puts a prototype or spike step\n"
+        "  first; a necessary path the WP must change may be added to 'owns' when no other WP owns it. Keep the Goal's intent and\n"
+        "  every acceptance criterion: never weaken a check so that failing work passes. Never edit the Progress log or Review."
+    )
+    edit_limit = "Do not edit any repository file." if wp.is_github else f"You may edit only {wp_path}."
     return f"""{files}
 
-You are re-evaluating work package {wp.id} ({wp.title}), whose file is above: {why}.
+You are re-evaluating work package {wp.id} ({wp.title}), whose specification is above: {why}.
 So far: {ledger.rounds} builder rounds, {ledger.evaluations} earlier re-evaluations. Its builder runs on '{builder_spec}'.
 A failed round is not a reason to give up or to cap effort. A WP that keeps failing was usually harder than planned, or
-its file misleads the builder, or the reviews disagree with each other. Find out which, and change what the next round does.
+its specification misleads the builder, or the reviews disagree with each other. Find out which, and change what the next round does.
 
 Weigh its Goal, Context, Steps, Acceptance criteria, Progress log, Review and any earlier '{REEVALUATION_SECTION}' entries.
 Look at the work so far with 'git diff {context.project.main_branch} --stat'
@@ -699,21 +741,18 @@ The latest failures, oldest first:
 {history}
 
 Reviews and builders work under the protocol below; a finding still disputed after two rejected vetoes is yours to settle.
-Say which side the WP file supports; when the dispute comes from the WP file itself, decide 'revise' and make it unambiguous.
+Say which side the WP specification supports; when the dispute comes from the specification itself, decide 'revise' and make it unambiguous.
 {findings.REVIEW_PROTOCOL}
 
 {findings.ledger_text(run_dir)}
 
 Decide exactly one:
 - continue: the failures converge and the next builder can fix them from the feedback. Say what to focus on.
-- revise: the WP file itself is the problem. Edit it: a Context note headed '**Re-evaluation note ({datetime.now():%Y-%m-%d}).**'
-  that scopes a finding that over-reads the Goal, reorders the Steps into smaller ones, or puts a prototype or spike step
-  first; a necessary path the WP must change may be added to 'owns' when no other WP owns it. Keep the Goal's intent and
-  every acceptance criterion: never weaken a check so that failing work passes. Never edit the Progress log or Review.
+{revise_guidance}
 - escalate <tier>: the work needs more capability than '{builder_spec}'. Tiers: {tiers}.
 - split: the WP is several WPs. Describe the split (titles, owns, order, dependencies) for the orchestrator.
 - needs-user <question>: only a decision the user must make blocks it.
-You may edit only {wp_path}. Explain your reasoning briefly; it is recorded in the WP file for the next builder.
+{edit_limit} Explain your reasoning briefly; it is recorded in the local ledger for the next builder.
 End with exactly one line: 'DECISION: continue', 'DECISION: revise', 'DECISION: escalate <tier>', 'DECISION: split'
 or 'DECISION: needs-user <question>'.
 """
@@ -766,7 +805,10 @@ def settle_native_sessions(context: Context, wp: wpfile.WorkPackage, record_writ
     # Written only after every survivor and worker is checked: a note in the WP file would read as
     # a later one's own edit in its scope check.
     for note in notes:
-        wpfile.log_progress(wpfile.parse(wp.path), note, "runner")
+        if getattr(wp, "is_github", False) and hasattr(context, "log_wp_progress"):
+            context.log_wp_progress(wp, note, "runner")
+        else:
+            wpfile.log_progress(wpfile.parse(wp.path), note, "runner")
     return violations
 
 
@@ -889,11 +931,12 @@ def stop_delegated_workers(context: Context, wp: wpfile.WorkPackage, wait: bool 
         for request in (read_json(bridge.request_path(request["id"])) for request in requests):
             if request.get("disposition") == "scope_violation" and (request["id"] in finished or (since is not None and request["created_at"] >= since)):
                 violations.append(request["id"])
-        if violations and (current := wpfile.parse(wp.path)).status != "blocked":
-            wpfile.set_status(current, "blocked")
+        current = wp if wp.is_github else wpfile.parse(wp.path)
+        if violations and current.status != "blocked":
+            context.set_wp_status(current, "blocked")
             context.journal.emit("wp-blocked", f"delegated worker(s) of {wp.id} changed paths outside their task ({', '.join(violations)})", {"wp": wp.id})
         for name in killed:
-            wpfile.log_progress(wpfile.parse(wp.path), f"stopped worker '{name}', still running when the builder session ended")
+            context.log_wp_progress(wp if wp.is_github else wpfile.parse(wp.path), f"stopped worker '{name}', still running when the builder session ended")
         with delegate_lock(context, wp.id):
             gate = read_json(gate_path(context, wp.id), {})
             if gate.get("report_since") is not None:
@@ -915,12 +958,12 @@ class WorkPackageRun:
 
     def __init__(self, context: Context, wp_id: str, tree: Path, options: RunOptions) -> None:
         self.context = context
-        self.wp_id = wp_id
+        self.wp_id = context.normalize_id(wp_id)
         self.tree = tree
         self.options = options
         self.config = context.project.config
-        self.run_dir = context.project.wp_run_dir(wp_id)
-        self.env = session_env(context, wp_id, tree)
+        self.run_dir = context.project.wp_run_dir(self.wp_id)
+        self.env = session_env(context, self.wp_id, tree)
         wp = self.wp()
         self.lane = context.project.lane(options.lane or wp.lane)
         self.families = tuple(options.families or self.lane.get("families", ()))
@@ -931,10 +974,20 @@ class WorkPackageRun:
         (self.run_dir / NO_ROUTE_FILE).unlink(missing_ok=True)
 
     def wp(self) -> wpfile.WorkPackage:
-        return self.context.wp_in_tree(self.wp_id, self.tree)
+        if hasattr(self.context, "wp_in_tree"):
+            return self.context.wp_in_tree(self.wp_id, self.tree)
+        return wpfile.find(self.project.wp_dir(self.tree), self.wp_id)
 
     def log(self, message: str) -> None:
+        if hasattr(self.context, "log_wp_progress"):
+            self.context.log_wp_progress(self.wp(), message)
+            return
         wpfile.log_progress(self.wp(), message)
+
+    def set_status(self, status: str) -> wpfile.WorkPackage:
+        if hasattr(self.context, "set_wp_status"):
+            return self.context.set_wp_status(self.wp(), status)
+        return wpfile.set_status(self.wp(), status)
 
     def emit(self, kind: str, message: str) -> None:
         self.context.journal.emit(kind, message, {"wp": self.wp_id})
@@ -942,13 +995,13 @@ class WorkPackageRun:
     def session(self, spec: str, role: str, prompt: str, log_stem: Path, status_to_restore: str, **extra) -> object:
         from .continuous import checkpoint
         if checkpoint(self.context, self.wp_id):
-            wpfile.set_status(self.wp(), status_to_restore)
+            self.set_status(status_to_restore)
             raise RunPaused(None)
         access = "reviewer" if role == "reviewer" else "builder"
         # A builder session that never started wrote nothing: the writing record goes back to what it was.
         writing_before = extra.pop("writing_before", self.ledger.writing)
         if pause_requested(self.run_dir) is not None:
-            wpfile.set_status(self.wp(), status_to_restore)
+            self.set_status(status_to_restore)
             raise RunPaused(None)
         # Every role, staged ones included, routes in the WP's mode (or the one its spec names), which
         # is recorded once a route is chosen, so the WP keeps it whatever happens to this runner.
@@ -969,7 +1022,7 @@ class WorkPackageRun:
             if role == "builder" and not error.failures:
                 self.ledger.state["writing"] = writing_before
                 self.ledger.save()
-            wpfile.set_status(self.wp(), status_to_restore)
+            self.set_status(status_to_restore)
             self.log(f"no route for the {role} ({spec}): {error}; round not counted; status {status_to_restore}; run stopped")
             # The supervisor sleeps on this: the spec that failed may not be the one it pre-checked
             # (staged tiers, a busy local model).
@@ -1005,7 +1058,10 @@ class WorkPackageRun:
             violations = stop_delegated_workers(self.context, self.wp())
         finally:
             if getattr(in_flight, "stalled_wp", None) and all(request["state"] in TERMINAL_STATES for request in Bridge(self.context).wp_requests(self.wp_id, "session", "worker")):
-                wpfile.set_status(self.wp(), "blocked")
+                if hasattr(self.context, "set_wp_status"):
+                    self.context.set_wp_status(self.wp(), "blocked")
+                else:
+                    wpfile.set_status(self.wp(), "blocked")
                 self.emit("wp-blocked", str(in_flight))
         if violations:
             raise T3Error(worker_violation(self.wp_id, violations))
@@ -1048,7 +1104,7 @@ class WorkPackageRun:
         status_before = wp.status
         failures_before = self.ledger.failures
         result: SessionResult | None = None
-        wpfile.set_status(wp, "in_progress")
+        self.set_status("in_progress")
         self.log(f"round {round_number} started for builder {'staged mode' if self.staged else self.builder_spec}")
         if self.staged:
             from .staged import StagedBuild  # staged mode imports the runner's helpers
@@ -1100,7 +1156,7 @@ class WorkPackageRun:
         if wp.status == "blocked":
             # Builders often block on something that is not a real block (an over-read Goal, a
             # one-line fix outside owns); the re-evaluation decides whether it is.
-            wpfile.set_status(wp, "changes_requested")
+            self.set_status("changes_requested")
             self.log("builder reported blocked; a re-evaluation decides whether the block is real")
             self.ledger.fail("builder blocked", f"The builder set 'blocked'; its reason is the latest Progress log entry ({wp.latest_progress()})",
                              force_evaluation_after=self.evaluate_after)
@@ -1112,7 +1168,7 @@ class WorkPackageRun:
                 self.log(f"builder session ended short of review (status {wp.status}); round not counted; its session is continued")
                 self.emit("session-interrupted", f"{self.wp_id} builder session on {result.route['id']} ended short of review; continued without counting a round")
                 return "interrupted"
-            wpfile.set_status(wp, "changes_requested")
+            self.set_status("changes_requested")
             self.log(f"builder did not reach review (status {wp.status})")
             self.ledger.fail("builder stopped short", f"The builder ended with status '{wp.status}' instead of 'review'. Finish the remaining steps.")
         if self.ledger.failures != failures_before:
@@ -1251,8 +1307,9 @@ class WorkPackageRun:
         """Applies the project's fixers to the files this WP changed and owns (never shared files)."""
         wp = self.wp()
         wp_dir = self.context.project.wp_dir_relative
+        shared = {entry["path"] for entry in self.config["shared_files"]}
         files = [path for path in changed_paths(self.tree, self.context.project.main_branch)
-                 if not path.endswith(" (deleted)") and wpfile.path_owned(path, wp, wp_dir, ())]
+                 if not path.endswith(" (deleted)") and path not in shared and wpfile.path_owned(path, wp, wp_dir, ())]
         for report in run_fixers(self.tree, files, configured_fixers(self.config), self.env, self.config["command_timeout_minutes"]):
             self.log(f"autofix: {report}")
 
@@ -1261,11 +1318,7 @@ class WorkPackageRun:
         self.autofix()
         wp = self.wp()
         changed = changed_paths(self.tree, self.context.project.main_branch)
-        shared = [entry["path"] for entry in self.config["shared_files"]]
-        wp_dir = self.context.project.wp_dir_relative
-        # The orchestrator amends upcoming WP files in a worktree; those are not violations.
-        outside = [path for path in changed if not wpfile.path_owned(path.removesuffix(" (deleted)"), wp, wp_dir, shared)
-                   and not wpfile.is_wp_file(path, wp_dir) and not matches_main(self.tree, self.context.project.main_branch, path)]
+        outside = outside_owns(self.context, wp, self.tree)
         commands, scope_line = scoped_checks(self.config, self.tree, wp.round_checks(self.config["verify_round"], self.config["verify_workspace"]), changed)
         self.log(scope_line)
         with build_slot(int(self.config["build_slots"]), None, self.log):
@@ -1281,7 +1334,7 @@ class WorkPackageRun:
             problems.append("Verify failures:\n" + "\n\n".join(texts))
         if outside:
             problems.append("Files changed outside the WP's owns paths (revert or justify them): " + ", ".join(outside))
-        wpfile.set_status(wp, "changes_requested")
+        self.set_status("changes_requested")
         self.log(f"verification failed ({len(texts)} failing commands, {len(outside)} files outside owns{': ' + ', '.join(outside) if outside else ''})")
         return CheckResult("\n\n".join(problems), failures if commands else [], outside)
 
@@ -1291,12 +1344,14 @@ class WorkPackageRun:
         spec = with_mode(self.config["repair_spec"], self.mode)
         commands = ", ".join(failure.command for failure in failures)
         self.emit("repair-attempted", f"{self.wp_id}: only mechanical checks failed ({commands}); a {spec} repair session fixes them first")
+        wp = self.wp()
+        repair_paths = wp.owns if getattr(wp, "owns_explicit", True) else ["**"]
         try:
             # The lane's families hold here too; a cheap tier's order already puts free and local routes first.
-            result = run_session(self.context, spec, "worker", repair_prompt(self.context, self.wp(), failures),
-                                 self.run_dir / f"attempt-{round_number}-repair", self.tree, write_paths=self.wp().owns, families=self.families,
+            result = run_session(self.context, spec, "worker", repair_prompt(self.context, wp, failures),
+                                 self.run_dir / f"attempt-{round_number}-repair", self.tree, write_paths=repair_paths, families=self.families,
                                  idle_minutes=self.options.idle_minutes, event_fields={"wp": self.wp_id, "role": "repair"}, extra_env=self.env,
-                                 skills=builder_skills(self.context, self.wp().skills), on_attempt=self.mode_recorder(self.mode))
+                                 skills=builder_skills(self.context, wp.skills), on_attempt=self.mode_recorder(self.mode))
         except NoRouteError as error:
             self.log(f"no route for a repair session ({spec}): {error}; the builder gets the failure")
             return False
@@ -1310,11 +1365,11 @@ class WorkPackageRun:
         builder, or None when the WP passed and is in review again. A missing Try it section fails
         before the (slow) Verify commands run."""
         if self.config["require_try_it"] and (problem := try_it_problem(self.wp())):
-            wpfile.set_status(self.wp(), "changes_requested")
+            self.set_status("changes_requested")
             self.log(f"the '## {TRY_IT_SECTION}' section has no commands; verification not run")
             return problem
         if self.session_verified():
-            wpfile.set_status(self.wp(), "review")
+            self.set_status("review")
             self.log("verification skipped: the builder's wpo verify passed on this tree (only the WP file changed since)")
             return None
         result = self.check(round_number)
@@ -1326,7 +1381,7 @@ class WorkPackageRun:
             return result.feedback
         retried = self.check(round_number, "-after-repair")
         if retried.feedback is None:
-            wpfile.set_status(self.wp(), "review")
+            self.set_status("review")
             self.log("the repair session's fixes pass verification")
             return None
         return f"A repair session tried to fix the mechanical failures first; these remain:\n{retried.feedback}"
@@ -1347,9 +1402,14 @@ class WorkPackageRun:
         changed = git(self.tree, "diff", "--name-only", saved["tree"], worktree_tree_id(self.tree), check=False)
         if changed.returncode != 0:
             return False
-        wp_path = wp_relative(self.context, wp)
-        if not all(path == wp_path for path in changed.stdout.splitlines() if path):
-            return False
+        changed_files = [path for path in changed.stdout.splitlines() if path]
+        if wp.is_github:
+            if changed_files:
+                return False
+        else:
+            wp_path = wp_relative(self.context, wp)
+            if not all(path == wp_path for path in changed_files):
+                return False
         # The owns check reads main's current contents: main moving can fail an unchanged tree.
         return not outside_owns(self.context, wp, self.tree)
 
@@ -1359,7 +1419,7 @@ class WorkPackageRun:
         after `infrastructure_retry_minutes`."""
         minutes = float(self.config["infrastructure_retry_minutes"])
         commands = ", ".join(failure.command for failure in failures)
-        wpfile.set_status(self.wp(), "review")
+        self.set_status("review")
         self.log(f"verification failed on the machine, not the code ({commands}); no failed round; retried in {minutes:g} min")
         self.emit("verify-deferred", f"{self.wp_id}: every failed check failed on the machine ({commands}); verification retried in {minutes:g} min")
         report = {"spec": "verification", "role": "verify", "next_available_at": datetime.now().timestamp() + minutes * 60,
@@ -1384,13 +1444,14 @@ class WorkPackageRun:
         result = self.session(self.reviewer_spec, "reviewer", prompt, self.run_dir / f"attempt-{round_number}-review", "review",
                               skills=reviewer_skills(self.context), exclude_model_families=self.independent_review_exclusion())
         body = review_text(result.result_text, result.log_path, review_number)
-        wpfile.append_to_section(self.wp(), "Review", [f"### Review {review_number}, round {round_number} ({result.route['id']} for {self.reviewer_spec}, {datetime.now():%Y-%m-%d %H:%M})", body])
+        header = f"### Review {review_number}, round {round_number} ({result.route['id']} for {self.reviewer_spec}, {datetime.now():%Y-%m-%d %H:%M})"
+        self.context.append_wp_review(self.wp(), header, body, {"review": review_number, "round": round_number, "route": result.route["id"], "spec": self.reviewer_spec})
         verdict = last_verdict(body)
         parsed = findings.parse_review(body, review_number)
         for note in parsed.orchestrator_notes:
             self.emit("review-orchestrator-note", f"{self.wp_id} review {review_number}: {note}")
         if verdict is None:
-            wpfile.set_status(self.wp(), "review")
+            self.set_status("review")
             self.log("reviewer gave no verdict; left in review for a human")
             self.emit("wp-blocked", f"{self.wp_id} reviewer gave no verdict; left in review")
             raise WorkPackageEnded
@@ -1403,20 +1464,20 @@ class WorkPackageRun:
                 verdict = "CHANGES_REQUESTED"
                 note = f"review {review_number} said PASS but left {', '.join(contradicted)} blocking; treated as changes requested"
                 self.log(note)
-                wpfile.append_to_section(self.wp(), "Review", [f"The runner: {note}."])
+                self.context.append_wp_review(self.wp(), "", f"The runner: {note}.")
         still_open = findings.record_review(self.run_dir, review_number, parsed, passed=verdict == "PASS")
         if verdict == "PASS":
             self.finish("verified and review passed; done", f"{self.wp_id} verified and review passed")
         if not still_open:
             # Under the protocol only a BLOCKING finding, or a STILL-OPEN or VETO-REJECTED ruling, requests changes:
             # a rejection with none of them leaves the builder nothing it owes.
-            wpfile.set_status(self.wp(), "review")
+            self.set_status("review")
             self.log(f"review {review_number} requested changes without an open BLOCKING finding in the protocol's format; left in review")
             self.emit("wp-blocked", f"{self.wp_id} review {review_number} requested changes but no BLOCKING finding is open in the ledger; "
                       "read its Review entry, then rerun the review or pass it")
             raise WorkPackageEnded
         identifiers = ", ".join(finding["id"] for finding in still_open)
-        wpfile.set_status(self.wp(), "changes_requested")
+        self.set_status("changes_requested")
         self.log(f"review {review_number} requested changes: {identifiers}")
         self.emit("wp-changes-requested", f"{self.wp_id} review {review_number} requested changes (round {round_number}; open: {identifiers})")
         return findings.builder_feedback(still_open, body)
@@ -1443,7 +1504,7 @@ class WorkPackageRun:
     def finish(self, progress: str, event: str) -> None:
         """Marks the WP done and records the tree that was verified, so integration knows whether
         what it commits is exactly what passed."""
-        wpfile.set_status(self.wp(), "done")
+        self.set_status("done")
         self.log(progress)
         (self.run_dir / VERIFIED_TREE_FILE).write_text(worktree_tree_id(self.tree), encoding="utf-8")
         self.emit("wp-done", event)
@@ -1453,7 +1514,7 @@ class WorkPackageRun:
         """Blocks the WP. The ledger forgets its failures (and, when handed to the orchestrator, its
         re-evaluations), so whoever unblocks it starts with a builder round, not a re-evaluation."""
         self.ledger.unblocked_start(clear_evaluations=hand_over)
-        wpfile.set_status(self.wp(), "blocked")
+        self.set_status("blocked")
         self.log(progress)
         self.emit(kind, event)
         raise WorkPackageEnded
@@ -1464,6 +1525,28 @@ class WorkPackageRun:
         except RoutingError:
             return False
         return True
+
+    def _apply_local_revision(self, body: str) -> None:
+        """Applies an optional ```wpo-revision JSON block from a GitHub-mode evaluator to local state."""
+        blocks = REVISION_BLOCK.findall(body)
+        if not blocks:
+            return
+        try:
+            revision = json.loads(blocks[-1])
+        except ValueError:
+            return
+        if not isinstance(revision, dict):
+            return
+        if note := revision.get("context_note"):
+            self.context.add_wp_context_note(self.wp(), str(note), kind="reevaluation")
+        if isinstance(revision.get("add_owns"), list):
+            current_wp = self.wp()
+            merged_owns = list(dict.fromkeys([*current_wp.owns, *(str(p).strip() for p in revision["add_owns"] if str(p).strip())]))
+            self.context.set_wp_field(current_wp, "owns", merged_owns)
+        if isinstance(revision.get("add_verify"), list):
+            current_wp = self.wp()
+            merged_verify = list(dict.fromkeys([*current_wp.verify_commands(), *(str(c).strip() for c in revision["add_verify"] if str(c).strip())]))
+            self.context.set_wp_field(current_wp, "verify", merged_verify)
 
     def reevaluate(self) -> None:
         """Asks a strong model why the WP is not converging and applies its decision; raises
@@ -1480,8 +1563,10 @@ class WorkPackageRun:
         prompt = evaluation_prompt(self.context, wp, self.tree, ledger, self.builder_spec, self.run_dir, why)
         self.log(f"re-evaluating: {why}")
         # Any family: a lane restricted to free or local models still gets a strong evaluator.
+        eval_access = "read" if wp.is_github else "evaluator"
+        eval_write_paths = [] if wp.is_github else [wp_path]
         result = self.session(with_mode(self.config["evaluation_spec"], self.mode), "evaluator", prompt, self.run_dir / f"evaluation-{ledger.evaluations + 1}", wp.status,
-                              access="evaluator", write_paths=[wp_path], families=())
+                              access=eval_access, write_paths=eval_write_paths, families=())
         body = result.result_text.strip()
         decisions = DECISION.findall(body)
         decision, argument = (decisions[-1][0], decisions[-1][1].strip(DECISION_ARGUMENT_TRIM)) if decisions else ("none", "")
@@ -1490,12 +1575,14 @@ class WorkPackageRun:
         # The ledger records the evaluation before the file shows it: a crash in between costs a
         # section entry, never a repeated evaluation or a lost escalation.
         ledger.evaluated(decision, f"The re-evaluation after round {after_round} decided '{decision}'"
-                         f"{' and revised the WP file' if decision == 'revise' else ''}; its reasoning is the latest '{REEVALUATION_SECTION}' entry:\n{body}",
+                         f"{' and revised the WP specification' if decision == 'revise' else ''}; its reasoning is the latest '{REEVALUATION_SECTION}' entry:\n{body}",
                          escalated_to)
-        wpfile.ensure_section(self.wp(), REEVALUATION_SECTION, before="Review")
-        wpfile.append_to_section(self.wp(), REEVALUATION_SECTION, [f"### After round {after_round} ({result.route['id']}, {datetime.now():%Y-%m-%d %H:%M})", body])
+        header = f"### After round {after_round} ({result.route['id']}, {datetime.now():%Y-%m-%d %H:%M})"
+        self.context.append_wp_reevaluation(self.wp(), header, body, {"after_round": after_round, "route": result.route["id"], "decision": decision, "argument": argument})
+        if wp.is_github and decision == "revise":
+            self._apply_local_revision(body)
         if escalated_to:
-            wpfile.set_field(self.wp(), "builder", escalated_to)
+            self.context.set_wp_field(self.wp(), "builder", escalated_to)
         self.emit("wp-reevaluated", f"{self.wp_id} re-evaluated after round {after_round}: {decision} {argument}".strip())
         self.log(f"re-evaluation decided {decision} {argument}".rstrip())
         if decision == "none":
@@ -1511,7 +1598,7 @@ class WorkPackageRun:
             self.end_blocked("wp-blocked", f"re-evaluation needs a user decision: {argument}", f"{self.wp_id} needs a user decision: {argument}")
         if escalated_to and self.lane.get("pool"):
             # A pool lane's model was not enough; the WP's own lane builds it on the stronger tier.
-            wpfile.set_status(self.wp(), "changes_requested")
+            self.set_status("changes_requested")
             self.log(f"escalated to {escalated_to}; left to the {self.wp().lane or 'milestone'} supervisor")
             raise WorkPackageEnded
 
@@ -1586,8 +1673,9 @@ class WorkPackageEnded(Exception):
 def run_wp(context: Context, wp_id: str, tree: Path, options: RunOptions) -> int:
     """Runs a WP; returns 0, or EXIT_NO_ROUTE when no route could serve a session."""
     from .artifacts import space_problem
+    wp_id = context.normalize_id(wp_id)
     if problem := space_problem(context.project, tree):
-        wpfile.set_status(context.wp_in_tree(wp_id, tree), "blocked")
+        context.set_wp_status(context.wp_in_tree(wp_id, tree), "blocked")
         context.journal.emit("wp-blocked", f"{wp_id}: {problem}", {"wp": wp_id})
         print(problem)
         return 0

@@ -121,7 +121,8 @@ class StagedBuild:
 
     def owns_check(self, path: str) -> bool:
         project = self.wp_run.context.project
-        return wpfile.path_owned(path, self.wp_run.wp(), project.wp_dir_relative, ()) and not wpfile.is_wp_file(path, project.wp_dir_relative)
+        wp = self.wp_run.wp()
+        return wpfile.path_owned(path, wp, project.wp_dir_relative, ()) and (wp.is_github or not wpfile.is_wp_file(path, project.wp_dir_relative))
 
     def emit(self, kind: str, message: str) -> None:
         self.wp_run.context.journal.emit(kind, message, {"wp": self.wp_run.wp_id})
@@ -129,9 +130,8 @@ class StagedBuild:
     # ---------------------------------------------------------------------------------- planning
 
     def wp_file(self) -> str:
-        """The WP file, inlined at the top of every staged prompt."""
-        wp = self.wp_run.wp()
-        return included_files(self.wp_run.tree, [f"{self.wp_run.context.project.wp_dir_relative}/{wp.file_name}"])
+        """The WP specification, inlined at the top of every staged prompt."""
+        return self.wp_run.context.wp_prompt_text(self.wp_run.wp(), self.wp_run.tree)
 
     def plan(self, reason: str, state: dict) -> list[Task]:
         """Runs the planner until it writes a valid plan (two tries per call)."""
@@ -211,7 +211,7 @@ A passing `wpo verify` is the only way to review."""
                              self.state_dir / f"attempt-{self.attempt}-assemble", self.status_before, stop_on_compaction=True,
                              skills=builder_skills(self.wp_run.context, wp.skills))
         except CompactionStop as stopped:
-            wpfile.log_progress(self.wp_run.wp(), f"assembler reached compaction and was stopped ({stopped.log_path}); the next attempt resumes")
+            self.wp_run.context.log_wp_progress(self.wp_run.wp(), f"assembler reached compaction and was stopped ({stopped.log_path}); the next attempt resumes")
 
     def run(self) -> None:
         """Plans, executes and assembles; a WP that does not reach review returns to the runner,
@@ -219,7 +219,7 @@ A passing `wpo verify` is the only way to review."""
         try:
             self._run()
         except PlanError as error:
-            wpfile.log_progress(self.wp_run.wp(), f"the planner could not write a valid plan: {error}")
+            self.wp_run.context.log_wp_progress(self.wp_run.wp(), f"the planner could not write a valid plan: {error}")
 
     def _run(self) -> None:
         state = self.load_state()
@@ -249,7 +249,7 @@ A passing `wpo verify` is the only way to review."""
                 entry["state"] = "done"
                 self.save_state(state)
                 self.emit("staged-task", f"{self.wp_run.wp_id}: task {task.id} done")
-                wpfile.log_progress(self.wp_run.wp(), f"staged task {task.id} ({task.title}) done", "runner")
+                self.wp_run.context.log_wp_progress(self.wp_run.wp(), f"staged task {task.id} ({task.title}) done", "runner")
                 index += 1
                 continue
             if not reason and entry["tries"] < 2:
@@ -258,7 +258,7 @@ A passing `wpo verify` is the only way to review."""
                 continue
             reason = reason or f"task '{task.id}' failed its check twice:\n{self.last_check_failure}"
             if state["replans"] >= int(self.settings["max_replans"]):
-                wpfile.log_progress(self.wp_run.wp(), f"staged mode gave up after {state['replans']} replans: {reason[:300]}")
+                self.wp_run.context.log_wp_progress(self.wp_run.wp(), f"staged mode gave up after {state['replans']} replans: {reason[:300]}")
                 self.save_state(state)
                 return
             state["replans"] += 1

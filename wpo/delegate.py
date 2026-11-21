@@ -89,7 +89,7 @@ class Delegation:
                 raise DelegateError(f"write path '{path}' must be repo-relative with no '..'")
             # The glob's fixed prefix stands for every file it can match.
             representative = re.sub(r"\*\*.*$", "x/x.rs", path).replace("*", "x")
-            if wpfile.is_wp_file(representative, wp_dir) or not wpfile.path_owned(representative, self.wp, wp_dir, ()):
+            if (not self.wp.is_github and wpfile.is_wp_file(representative, wp_dir)) or not wpfile.path_owned(representative, self.wp, wp_dir, ()):
                 raise DelegateError(f"write path '{path}' is not inside {self.wp_id}'s owns ({', '.join(self.wp.owns)})")
 
     def start(self, name: str, task: str | None, prompt_file: str | None, write_paths: list[str], tier: str | None) -> None:
@@ -185,7 +185,7 @@ class Delegation:
                 yield
         write_list = "\n".join(f"- {path}" for path in state["write_paths"])
         rules = "\n".join(self.context.project.config["prompt_rules"])
-        wp_file = included_files(self.tree, [f"{self.context.project.wp_dir_relative}/{self.wp.file_name}"])
+        wp_file = self.context.wp_prompt_text(self.wp, self.tree)
         prompt = f"""{wp_file}
 
 You are a worker on work package {self.wp_id}, whose file is above (for context only: never edit it). Its lead gave you the one task below.

@@ -1,15 +1,14 @@
-"""Merges a finished WP's worktree into the main branch.
+"""Delivers a finished work item to the main branch: either by local fast-forward (`delivery: local-ff`)
+or by pushing the branch, opening/updating a sanitized GitHub PR (`Fixes #N`), and arming GitHub
+auto-merge (`delivery: pr-automerge | pr | pr-draft`).
 
-Commits the worktree on its branch, merges main into the branch, runs the full workspace checks
-(`verify_workspace`, which rounds do not run) and refuses a merge whose checks changed any file,
-fast-forwards main under a machine-wide mutex, removes the worktree, branch and per-WP build output,
-and runs post-merge hooks whose paths changed. Main only ever moves by fast-forward to a verified
-commit, so the user's checkout always builds. This is the only thing that commits for a WP.
+Both paths commit uncommitted worktree changes, merge the base branch (reconciling configured lock
+files on lockfile-only conflicts), run the full workspace checks (`verify_workspace`), and refuse
+delivery if checks dirty the tree.
 """
 
 from __future__ import annotations
 
-import shutil
 import subprocess
 import tempfile
 from pathlib import Path
@@ -19,11 +18,12 @@ from .commands import run_commands
 from .context import Context
 from .platform import NamedMutex
 from .project import git
-from .scope import scope_for, scoped_checks
 from .runner import VERIFIED_TREE_FILE, session_env, unsettled
+from .scope import scope_for, scoped_checks
 from .t3 import Bridge, T3Error
 
 EXIT_MERGED, EXIT_CONFLICT, EXIT_VERIFY_FAILED, EXIT_FAST_FORWARD_FAILED = 0, 5, 6, 7
+EXIT_PR_OPENED = 9
 # Outcomes of bringing main in again under the mutex (not exit codes).
 MAIN_UNCHANGED, MAIN_MOVED = "main-unchanged", "main-moved"
 # Verifications run unlocked before one runs under the mutex, so a busy main cannot starve a merge.
@@ -34,19 +34,74 @@ EXIT_MEANINGS = {
     EXIT_VERIFY_FAILED: "verification failed after merging main",
     EXIT_FAST_FORWARD_FAILED: "main could not fast-forward",
     8: "the T3 backend or the boot fence failed",
+    EXIT_PR_OPENED: "PR opened (auto-merge armed or awaiting checks/merge)",
 }
+
+
+def run_post_merge_hooks(
+    context: Context,
+    before: str,
+    log_path: Path | None = None,
+    *,
+    after: str = "HEAD",
+    wp_id: str | None = None,
+    log_fn=None,
+) -> None:
+    """Runs configured `post_merge_hooks` in the main checkout for paths changed in `before..after`."""
+    project = context.project
+    target_log = log_path or (project.runs_dir / "post-merge.log")
+    changed = git(project.root, "diff", "--name-only", before, after).stdout.splitlines()
+    for hook in project.config["post_merge_hooks"]:
+        patterns = [wpfile.glob_to_regex(pattern) for pattern in hook["when_changed"]]
+        if not any(pattern.match(path) for path in changed for pattern in patterns):
+            continue
+        failures = run_commands(project.config["shell"], [hook["command"]], project.root, project.env_for(None), target_log,
+                                project.config["command_timeout_minutes"])
+        if log_fn is not None:
+            log_fn(f"post-merge hook '{hook['command']}': {'failed' if failures else 'ok'}")
+        if failures:
+            prefix = f"{wp_id} merged" if wp_id else "merged"
+            fields = {"wp": wp_id} if wp_id else {}
+            context.journal.emit("integration-failed", f"{prefix}, but post-merge hook '{hook['command']}' failed (log {target_log})", fields)
+
+
+def cleanup_merged_outputs(context: Context, wp_id: str, log_fn=None) -> None:
+    """Removes configured per-WP build output after a merge (retaining T3 checkouts)."""
+    from .artifacts import remove_output
+    from .project import ProjectError
+
+    def _log(msg: str) -> None:
+        if log_fn is not None:
+            log_fn(msg)
+
+    try:
+        output_paths = context.project.paths_removed_after_merge(wp_id)
+    except (ProjectError, OSError, subprocess.CalledProcessError) as error:
+        _log(f"build cleanup refused: {error}")
+        context.journal.emit("cleanup-failed", f"{wp_id} merged, but build cleanup was refused: {error}", {"wp": wp_id})
+        output_paths = []
+    for path in output_paths:
+        if path.exists():
+            try:
+                remove_output(path)
+            except (OSError, ProjectError) as error:
+                _log(f"build cleanup failed for {path}: {error}")
+                context.journal.emit("cleanup-failed", f"{wp_id} merged, but build cleanup failed for {path}: {error}", {"wp": wp_id})
+            else:
+                _log(f"removed {path}")
 
 
 class Integration:
     def __init__(self, context: Context, wp_id: str, force_verify: bool) -> None:
         self.context = context
         self.project = context.project
-        self.wp_id = wp_id
+        self.wp_id = context.normalize_id(wp_id)
         self.force_verify = force_verify
-        self.worktree = self.project.worktree(wp_id)
-        self.branch = self.project.branch(wp_id)
+        self.worktree = self.project.worktree(self.wp_id)
+        self.branch = self.project.branch(self.wp_id)
         self.main = self.project.main_branch
-        self.log_path = self.project.wp_run_dir(wp_id) / "integrate.log"
+        self.log_path = self.project.wp_run_dir(self.wp_id) / "integrate.log"
+        self.last_verified_commands: list[str] = []
 
     def log(self, message: str) -> None:
         from datetime import datetime
@@ -76,7 +131,7 @@ class Integration:
         if git(self.worktree, "merge-base", "--is-ancestor", target, "HEAD", check=False).returncode == 0:
             return False
         if git(self.worktree, "merge", "--no-edit", target, check=False).returncode == 0:
-            self.log("merged main")
+            self.log(f"merged {target}")
             return True
         conflicts = [line for line in git(self.worktree, "diff", "--name-only", "--diff-filter=U").stdout.splitlines() if line]
         reconcilers = {entry["file"]: entry["command"] for entry in self.project.config["lockfile_reconcilers"]}
@@ -96,17 +151,19 @@ class Integration:
                 git(self.worktree, "merge", "--abort", check=False)
                 self.log(f"lock-file reconciliation failed, merge aborted: {error}")
                 return EXIT_CONFLICT
-            self.log(f"merged main; {', '.join(conflicts)} reconciled")
+            self.log(f"merged {target}; {', '.join(conflicts)} reconciled")
             return True
         git(self.worktree, "merge", "--abort", check=False)
-        self.log(f"merge conflict with main in: {', '.join(conflicts)}; merge aborted")
+        self.log(f"merge conflict with {target} in: {', '.join(conflicts)}; merge aborted")
         return EXIT_CONFLICT
 
     def paths_between(self, start: str, end: str) -> list[str]:
         return [line for line in git(self.worktree, "-c", "core.quotepath=off", "diff", "--name-only", "--no-renames", start, end).stdout.splitlines() if line]
 
-    def verify(self) -> bool:
-        commands, scope_line = scoped_checks(self.project.config, self.worktree, self.project.config["verify_workspace"], self.paths_between(self.main, "HEAD"))
+    def verify(self, base_ref: str | None = None) -> bool:
+        base = base_ref or self.main
+        commands, scope_line = scoped_checks(self.project.config, self.worktree, self.project.config["verify_workspace"], self.paths_between(base, "HEAD"))
+        self.last_verified_commands = list(commands)
         self.log(scope_line)
         failures = run_commands(self.project.config["shell"], commands, self.worktree,
                                 session_env(self.context, self.wp_id, self.worktree), self.log_path, self.project.config["command_timeout_minutes"])
@@ -121,11 +178,9 @@ class Integration:
             return False
         return True
 
-    def bring_main_in_again(self, verify_under_mutex: bool) -> int:
+    def bring_main_in_again(self, verify_under_mutex: bool) -> int | str:
         """Called under the integration mutex after verifying unlocked. MAIN_UNCHANGED when the
-        branch holds main's tip and stands verified (main did not move, or its new commits reach
-        no package this WP reaches: each was verified on its own merge, so only packages both
-        changes reach can break together); MAIN_MOVED when the new merge needs verifying again;
+        branch holds main's tip and stands verified; MAIN_MOVED when the new merge needs verifying again;
         else an exit code."""
         verified_main = git(self.worktree, "merge-base", self.main, "HEAD").stdout.strip()
         main_tip = git(self.worktree, "rev-parse", self.main).stdout.strip()
@@ -133,8 +188,6 @@ class Integration:
             return MAIN_UNCHANGED
         if self.merge_main(main_tip) == EXIT_CONFLICT:
             return EXIT_CONFLICT
-        # Both reaches are read from the merged tree's package graph: an edge either side added
-        # (a manifest naming the other's package) is in it.
         ours = scope_for(self.project.config, self.worktree, self.paths_between(main_tip, "HEAD"))
         theirs = scope_for(self.project.config, self.worktree, self.paths_between(verified_main, main_tip))
         if ours.packages is not None and theirs.packages is not None and not set(ours.packages) & set(theirs.packages):
@@ -160,9 +213,7 @@ class Integration:
         return merging or unmerged
 
     def verified_tree_matches(self) -> bool:
-        """Whether the tip differs from the tree the runner verified only in `verify_neutral_paths`
-        (plans and orchestration state no build or test reads): main's plan edits or the WP file's
-        Handoff since verification cannot change the verified result."""
+        """Whether the tip differs from the tree the runner verified only in `verify_neutral_paths`."""
         record = self.project.wp_run_dir(self.wp_id) / VERIFIED_TREE_FILE
         if not record.exists():
             return False
@@ -176,50 +227,118 @@ class Integration:
         return all(any(pattern.match(path) for pattern in patterns) for path in changed.stdout.splitlines() if path)
 
     def post_merge(self, before: str) -> None:
-        changed = git(self.project.root, "diff", "--name-only", before, "HEAD").stdout.splitlines()
-        for hook in self.project.config["post_merge_hooks"]:
-            patterns = [wpfile.glob_to_regex(pattern) for pattern in hook["when_changed"]]
-            if not any(pattern.match(path) for path in changed for pattern in patterns):
-                continue
-            failures = run_commands(self.project.config["shell"], [hook["command"]], self.project.root, self.project.env_for(None), self.log_path,
-                                    self.project.config["command_timeout_minutes"])
-            self.log(f"post-merge hook '{hook['command']}': {'failed' if failures else 'ok'}")
-            if failures:
-                self.context.journal.emit("integration-failed", f"{self.wp_id} merged, but post-merge hook '{hook['command']}' failed (log {self.log_path})", {"wp": self.wp_id})
+        run_post_merge_hooks(self.context, before, self.log_path, wp_id=self.wp_id, log_fn=self.log)
 
     def cleanup(self) -> None:
-        """Removes the worktree, branch and build output after main moved; a failure here (files
-        locked on Windows) does not undo the merge, so it is journaled for the orchestrator."""
-        from .artifacts import remove_output
-        from .project import ProjectError
-        try:
-            output_paths = self.project.paths_removed_after_merge(self.wp_id)
-        except (ProjectError, OSError, subprocess.CalledProcessError) as error:
-            self.log(f"build cleanup refused: {error}")
-            self.context.journal.emit("cleanup-failed", f"{self.wp_id} merged, but build cleanup was refused: {error}", {"wp": self.wp_id})
-            output_paths = []
+        """Removes the worktree, branch and build output after main moved."""
         if self.context.machine.execution_mode == "t3":
             self.log("retained T3-owned worktree and branch; their lifecycle belongs to T3")
         else:
             self.cleanup_standalone_worktree()
-        for path in output_paths:
-            if path.exists():
-                try:
-                    remove_output(path)
-                except (OSError, ProjectError) as error:
-                    self.log(f"build cleanup failed for {path}: {error}")
-                    self.context.journal.emit("cleanup-failed", f"{self.wp_id} merged, but build cleanup failed for {path}: {error}", {"wp": self.wp_id})
-                else:
-                    self.log(f"removed {path}")
+        cleanup_merged_outputs(self.context, self.wp_id, self.log)
 
     def cleanup_standalone_worktree(self) -> None:
         try:
-            # --force because ignored files (build output, task specs) remain; everything tracked is committed.
             git(self.project.root, "worktree", "remove", "--force", str(self.worktree))
             git(self.project.root, "branch", "--quiet", "-d", self.branch)
         except Exception as error:
             self.log(f"cleanup failed: {error}")
             self.context.journal.emit("cleanup-failed", f"{self.wp_id} merged into main, but removing its worktree or branch failed: {error}", {"wp": self.wp_id})
+
+    def _deliver_pr(self, wp: wpfile.WorkPackage, delivery: str) -> int:
+        """Pushes the verified branch, opens/updates a sanitized PR (`Fixes #N`), and arms auto-merge."""
+        from . import run_state
+        from .github import (
+            GhClient,
+            GhError,
+            GitHubTracker,
+            finalize_merged_pr,
+            render_pr_body,
+            sync_local_main,
+        )
+        from .privacy import PrivacyError, require_public_safe
+
+        remote = str(self.project.github_config.get("remote") or "origin")
+        # Refresh remote base branch when reachable; fall back to local main if no remote ref exists yet.
+        fetched = git(self.worktree, "fetch", "--quiet", remote, self.main, check=False)
+        remote_base = f"{remote}/{self.main}"
+        base_ref = remote_base if fetched.returncode == 0 and git(self.worktree, "rev-parse", "--verify", remote_base, check=False).returncode == 0 else self.main
+
+        self.save_worktree_changes(f"{self.wp_id}: {wp.title}")
+        merged = self.merge_main(base_ref)
+        if merged == EXIT_CONFLICT:
+            return EXIT_CONFLICT
+
+        must_verify = self.force_verify or bool(merged) or not self.rounds_ran_the_full_checks(wp) or not self.verified_tree_matches()
+        if must_verify and not self.verify(base_ref):
+            self.log("workspace verification failed; PR not pushed")
+            return EXIT_VERIFY_FAILED
+
+        verify_cmds = self.last_verified_commands or wp.round_checks(self.project.config["verify_round"], self.project.config["verify_workspace"])
+        actual_branch = git(self.worktree, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+        head_sha = git(self.worktree, "rev-parse", "HEAD").stdout.strip()
+        if git(self.worktree, "rev-list", "--count", f"{base_ref}..HEAD").stdout.strip() == "0":
+            self.log(f"branch {actual_branch} has no commits ahead of {base_ref}; refusing empty PR")
+            return EXIT_FAST_FORWARD_FAILED
+
+        # Validate outbound PR text before pushing so privacy violations fail fast with zero remote side effects.
+        privacy_enabled = bool(self.project.github_config.get("privacy_check", True))
+        try:
+            require_public_safe(wp.title, self.project.root, enabled=privacy_enabled)
+            render_pr_body(wp, verify_commands=verify_cmds, project_root=self.project.root, privacy_check=privacy_enabled)
+        except PrivacyError as error:
+            self.log(f"PR delivery refused before push: {error}")
+            self.context.journal.emit("integration-failed", f"{self.wp_id}: PR delivery failed: {error}", {"wp": self.wp_id})
+            return EXIT_FAST_FORWARD_FAILED
+
+        pushed = git(self.worktree, "push", "-u", remote, f"HEAD:{actual_branch}", check=False)
+        if pushed.returncode != 0:
+            self.log(f"git push to {remote}/{actual_branch} failed: {(pushed.stderr or pushed.stdout).strip()}")
+            return EXIT_FAST_FORWARD_FAILED
+        self.log(f"pushed {actual_branch} ({head_sha[:10]}) to {remote}")
+
+        tracker = self.context.tracker or GitHubTracker(
+            self.project,
+            GhClient(str(self.context.machine.raw.get("gh", "gh")), cwd=self.project.root),
+        )
+        try:
+            result = tracker.deliver_pr(wp, actual_branch, head_sha, delivery, verify_commands=verify_cmds)
+        except (GhError, PrivacyError) as error:
+            self.log(f"PR delivery failed: {error}")
+            self.context.journal.emit("integration-failed", f"{self.wp_id}: PR delivery failed: {error}", {"wp": self.wp_id})
+            return EXIT_FAST_FORWARD_FAILED
+
+        self.log(f"PR #{result.number} ({result.url}) state={result.state} auto_merge={result.auto_merge_enabled} merged={result.merged}")
+        if result.warning:
+            self.log(f"warning: {result.warning}")
+            self.context.journal.emit("pr-automerge-unavailable", f"{self.wp_id}: {result.warning}", {"wp": self.wp_id})
+        if result.merged:
+            sync_result = sync_local_main(self.context)
+            run_dir = self.project.wp_run_dir(self.wp_id)
+            pr_record = dict(run_state.load(run_dir).get("pr") or {})
+            if sync_result.moved and sync_result.before and not pr_record.get("merge_commit") and not pr_record.get("pre_sync_sha"):
+                pr_record["pre_sync_sha"] = sync_result.before
+                pr_record["post_sync_sha"] = sync_result.after
+                run_state.set_pr(run_dir, {"pre_sync_sha": sync_result.before, "post_sync_sha": sync_result.after})
+            finalize_merged_pr(
+                self.context,
+                self.wp_id,
+                pr_record,
+                sync_result,
+                log_path=self.log_path,
+                log_fn=self.log,
+                cleanup_fn=self.cleanup,
+            )
+            return EXIT_MERGED
+
+        self.context.journal.emit(
+            "pr-opened",
+            f"{self.wp_id} opened PR #{result.number} ({result.url})" + (" with auto-merge armed" if result.auto_merge_enabled else ""),
+            {"wp": self.wp_id, "pr": str(result.number), "url": result.url},
+        )
+        if result.auto_merge_enabled:
+            self.context.journal.emit("pr-automerge-enabled", f"{self.wp_id}: auto-merge armed on PR #{result.number} ({result.url})", {"wp": self.wp_id})
+        return EXIT_PR_OPENED
 
     def run(self) -> int:
         outstanding, delegation = unsettled(self.context, self.wp_id)
@@ -234,28 +353,28 @@ class Integration:
             Bridge(self.context).validate_workspace(self.wp_id)
         if not self.worktree.exists():
             raise FileNotFoundError(f"no worktree for {self.wp_id} at {self.worktree}")
-        current = git(self.project.root, "symbolic-ref", "--short", "HEAD", check=False).stdout.strip()
-        if current != self.main:
-            raise RuntimeError(f"the main checkout is on '{current or 'a detached HEAD'}', not {self.main}; integration refused")
         if self.unfinished_merge():
             self.log("the worktree has an unfinished merge (MERGE_HEAD or unmerged paths); finish or abort it first")
             return EXIT_CONFLICT
         wp = self.context.wp_in_tree(self.wp_id, self.worktree)
-        self.log(f"integrating {self.wp_id} ({wp.title})")
+        self.log(f"integrating {self.wp_id} ({wp.title}) via delivery={self.project.delivery_mode}")
+
+        delivery = self.project.delivery_mode
+        if delivery in ("pr", "pr-draft", "pr-automerge"):
+            return self._deliver_pr(wp, delivery)
+
+        current = git(self.project.root, "symbolic-ref", "--short", "HEAD", check=False).stdout.strip()
+        if current != self.main:
+            raise RuntimeError(f"the main checkout is on '{current or 'a detached HEAD'}', not {self.main}; integration refused")
         self.save_worktree_changes(f"{self.wp_id}: {wp.title}")
-        # Verification runs outside the integration mutex, so merges of other WPs proceed meanwhile;
-        # the mutex covers only bringing main in again and the fast-forward.
         merged = self.merge_main()
         if merged == EXIT_CONFLICT:
             return EXIT_CONFLICT
-        # Verify unless the runner already ran the full checks on this tree, give or take
-        # verify-neutral paths.
         must_verify = self.force_verify or not self.rounds_ran_the_full_checks(wp) or not self.verified_tree_matches()
         if must_verify and not self.verify():
             self.log("workspace verification failed; main not moved")
             return EXIT_VERIFY_FAILED
         for attempt in range(OPTIMISTIC_ATTEMPTS + 1):
-            # Main cannot move between deciding the branch stands verified and the fast-forward.
             with NamedMutex(self.project.integration_mutex):
                 outcome = self.bring_main_in_again(verify_under_mutex=attempt == OPTIMISTIC_ATTEMPTS)
                 if outcome in (EXIT_CONFLICT, EXIT_VERIFY_FAILED):
@@ -269,7 +388,6 @@ class Integration:
                         return EXIT_FAST_FORWARD_FAILED
                     self.log(f"main fast-forwarded to {self.branch} ({tip[:10]}){' after verification' if must_verify else ''}")
                     break
-            # Main brought changes that reach this WP's packages: verify the new merge, unlocked.
             must_verify = True
             if not self.verify():
                 self.log("workspace verification failed; main not moved")

@@ -95,7 +95,7 @@ def mechanical_report(project_name: str, started: datetime, findings: list[Findi
             lines.append(f"| {score:.2f} | {first} {wps[first].title} | {wps[first].status} | {second} {wps[second].title} | {wps[second].status} |")
         lines.append("")
     lines += ["## Open WPs", ""]
-    lines += [f"- {wp.id} [{wp.status}, lane {wp.lane or '-'}, {wp.milestone}] {wp.title}: `{wp.path.as_posix()}`" for wp in open_wps]
+    lines += [f"- {wp.id} [{wp.status}, lane {wp.lane or '-'}, {wp.milestone}] {wp.title}: {wp.url if wp.is_github and wp.url else f'`{wp.path.as_posix()}`'}" for wp in open_wps]
     return "\n".join(lines) + "\n"
 
 

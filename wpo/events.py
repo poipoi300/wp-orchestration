@@ -56,6 +56,12 @@ ATTENTION_KINDS = frozenset({
     "t3-session-quiet",
     # A lead's delegated worker stalled; its WP is blocked once the lead's workers are stopped.
     "delegate-worker-stalled",
+    # CI checks failed or merge conflicts appeared on a PR opened by WPO.
+    "pr-checks-failed",
+    # GitHub auto-merge could not be enabled on an opened PR (repo setting or branch rules).
+    "pr-automerge-unavailable",
+    # Refreshing GitHub issue/PR/board state failed.
+    "github-sync-failed",
 })
 INFO_KINDS = frozenset({
     # The worker barrier stopped a lead's workers but could not check them yet (a session of the WP
@@ -64,6 +70,11 @@ INFO_KINDS = frozenset({
     "boot-changed",
     "wp-done",
     "wp-merged",
+    "pr-opened",
+    "pr-automerge-enabled",
+    "github-synced",
+    "migration-done",
+    "ledger-pruned",
     "wp-changes-requested",
     "wp-reevaluated",
     "wp-handed-back",

@@ -1,7 +1,13 @@
-"""Commands a session runs inside its WP's tree: `wpo log` writes a dated Progress log line (and ticks
-a step), `wpo verify` applies the runner's fixers and runs the WP's Verify commands and owns check,
-printing only what failed. The session's environment names its WP, tree, role and route
-(`WPO_WORK_PACKAGE`, `WPO_TREE`, `WPO_ROLE`, `WPO_ROUTE`), so the model never types a date or a key.
+"""Commands a session runs inside its WP's tree:
+- `wpo log`: writes a dated Progress log line (and optionally ticks a step)
+- `wpo try-it`: records the `## Try it` verification/demo instructions (in local ledger or WP file)
+- `wpo block`: sets status to `blocked` and logs why
+- `wpo handoff`: records a session handoff for a fresh continuation
+- `wpo verify`: applies fixers, checks Try it and unanswered findings, runs scoped Verify commands
+  and the owns check, printing only what failed.
+
+The session's environment names its WP, tree, role and route (`WPO_WORK_PACKAGE`, `WPO_TREE`,
+`WPO_ROLE`, `WPO_ROUTE`), so the model never types a date or a key.
 """
 
 from __future__ import annotations
@@ -9,18 +15,23 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import re
 import time
 from pathlib import Path
 
 from . import wpfile
 from .autofix import configured_fixers, run_fixers
-from .scope import scoped_checks
-from .commands import HEARTBEAT_FILE, build_slot, changed_paths, matches_main, run_commands_detailed, worktree_tree_id
+from .commands import (
+    HEARTBEAT_FILE,
+    build_slot,
+    changed_paths,
+    matches_main,
+    run_commands_detailed,
+    worktree_tree_id,
+)
 from .context import Context
 from .project import git
+from .scope import scoped_checks
 
-UNCHECKED_STEP = re.compile(r"^(\s*[-*] )\[ \]")
 # The tree a session's `wpo verify` passed on; the runner skips its own verification of that tree.
 SESSION_VERIFIED_TREE_FILE = "session-verified-tree.txt"
 # A builder's handoff, written by `wpo handoff` and taken by the runner when the session ends.
@@ -29,6 +40,12 @@ HANDOFF_FILE = "handoff-submitted.md"
 
 class SessionCommandError(Exception):
     """A session command run outside a WP session, or with arguments that do not fit the WP."""
+
+
+def _wp_in_tree(context: Context, wp_id: str, tree: Path) -> wpfile.WorkPackage:
+    if hasattr(context, "wp_in_tree"):
+        return context.wp_in_tree(wp_id, tree)
+    return wpfile.find(context.project.wp_dir(tree), wp_id)
 
 
 def session_wp(context: Context) -> tuple[wpfile.WorkPackage, Path]:
@@ -41,39 +58,77 @@ def session_wp(context: Context) -> tuple[wpfile.WorkPackage, Path]:
         if not branch.startswith(prefix):
             raise SessionCommandError(f"not in a WP session or worktree (branch {branch})")
         wp_id = branch.removeprefix(prefix)
-    return wpfile.find(context.project.wp_dir(tree), wp_id), tree
-
-
-def tick_step(wp: wpfile.WorkPackage, number: int) -> str:
-    """Ticks the `number`th checkbox (1-based) of the Steps section; returns the step's text."""
-    text = wp.text()
-    newline = wpfile.newline_of(text)
-    lines = text.splitlines()
     try:
-        start = lines.index("## Steps")
-    except ValueError:
-        raise SessionCommandError(f"{wp.id} has no '## Steps' section") from None
-    end = next((index for index in range(start + 1, len(lines)) if lines[index].startswith("## ")), len(lines))
-    boxes = [index for index in range(start + 1, end) if re.match(r"^\s*[-*] \[[ xX]\]", lines[index])]
-    if not 1 <= number <= len(boxes):
-        raise SessionCommandError(f"{wp.id} has {len(boxes)} steps; there is no step {number}")
-    index = boxes[number - 1]
-    lines[index] = UNCHECKED_STEP.sub(r"\1[x]", lines[index], count=1)
-    wpfile.write_text(wp.path, newline.join(lines) + newline)
-    return lines[index].strip()
+        return _wp_in_tree(context, wp_id, tree), tree
+    except wpfile.WorkPackageError as error:
+        raise SessionCommandError(str(error)) from None
+
+
+def tick_step(wp: wpfile.WorkPackage, number: int, context: Context | None = None) -> str:
+    """Ticks the `number`th checkbox (1-based) of the Steps section; returns the step's text."""
+    try:
+        if context is not None and hasattr(context, "tick_wp_step"):
+            return context.tick_wp_step(wp, number)
+        # Standalone helper compatibility for callers without a Context (wp-file only).
+        import re
+        text = wp.text()
+        newline = wpfile.newline_of(text)
+        lines = text.splitlines()
+        try:
+            start = lines.index("## Steps")
+        except ValueError:
+            raise SessionCommandError(f"{wp.id} has no '## Steps' section") from None
+        end = next((index for index in range(start + 1, len(lines)) if lines[index].startswith("## ")), len(lines))
+        boxes = [index for index in range(start + 1, end) if re.match(r"^\s*[-*] \[[ xX]\]", lines[index])]
+        if not 1 <= number <= len(boxes):
+            raise SessionCommandError(f"{wp.id} has {len(boxes)} steps; there is no step {number}")
+        index = boxes[number - 1]
+        lines[index] = re.sub(r"^(\s*[-*] )\[ \]", r"\1[x]", lines[index], count=1)
+        wpfile.write_text(wp.path, newline.join(lines) + newline)
+        return lines[index].strip()
+    except wpfile.WorkPackageError as error:
+        raise SessionCommandError(str(error)) from None
 
 
 def log(context: Context, message: str, step: int | None) -> str:
-    wp, _ = session_wp(context)
-    if os.environ.get("WPO_T3_REQUEST_ID") and context.machine.execution_mode == "t3":
+    wp, tree = session_wp(context)
+    machine = getattr(context, "machine", None)
+    if os.environ.get("WPO_T3_REQUEST_ID") and machine is not None and machine.execution_mode == "t3":
         from .t3 import Bridge
         Bridge(context).update(os.environ["WPO_T3_REQUEST_ID"], last_activity_at=time.time())
     if step is not None:
-        tick_step(wp, step)
-        wp = wpfile.parse(wp.path)
+        tick_step(wp, step, context)
+        wp = _wp_in_tree(context, wp.id, tree)
     actor = f"{os.environ.get('WPO_ROLE') or 'builder'} {os.environ.get('WPO_ROUTE') or 'unknown-route'}"
+    if hasattr(context, "log_wp_progress"):
+        return context.log_wp_progress(wp, message.strip(), actor)
     wpfile.log_progress(wp, message.strip(), actor)
     return wpfile.parse(wp.path).latest_progress()
+
+
+def try_it(context: Context, text: str) -> str:
+    """Records the `## Try it` instructions (in the private local ledger for GitHub tasks, or in
+    the WP file for wp-files projects) so `wpo verify` and PR creation can use them."""
+    wp, _ = session_wp(context)
+    if not text.strip():
+        raise SessionCommandError("Try it text is empty: give commands in a fenced block or start with 'Nothing to try by hand:'")
+    updated = context.set_wp_try_it(wp, text.strip())
+    from .whats_new import try_it_problem
+    if problem := try_it_problem(updated):
+        return f"Recorded Try it for {wp.id}, but note: {problem}"
+    return f"Recorded Try it for {wp.id}."
+
+
+def block(context: Context, reason: str) -> str:
+    """Marks the current work item as blocked and logs why."""
+    wp, tree = session_wp(context)
+    if not reason.strip():
+        raise SessionCommandError("give the reason the work is blocked")
+    actor = f"{os.environ.get('WPO_ROLE') or 'builder'} {os.environ.get('WPO_ROUTE') or 'unknown-route'}"
+    context.log_wp_progress(wp, f"blocked: {reason.strip()}", actor)
+    updated = context.wp_in_tree(wp.id, tree)
+    context.set_wp_status(updated, "blocked")
+    return f"{wp.id}: status set to blocked ({reason.strip()})"
 
 
 def handoff(context: Context, text: str) -> str:
@@ -84,6 +139,8 @@ def handoff(context: Context, text: str) -> str:
     path = context.project.wp_run_dir(wp.id) / HANDOFF_FILE
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text.strip() + "\n", encoding="utf-8")
+    if wp.is_github:
+        context.set_wp_handoff(wp, text.strip())
     return f"Handoff recorded ({len(text.strip()):,} characters). End your turn now; a fresh session continues from it."
 
 
@@ -102,7 +159,10 @@ def verify(context: Context) -> tuple[bool, str]:
     fingerprint = checks_fingerprint(context, wp, tree)
     passed, report = run_checks(context, wp, tree)
     if passed and wp.status in ("in_progress", "changes_requested"):
-        wpfile.set_status(wp, "review")
+        if hasattr(context, "set_wp_status"):
+            context.set_wp_status(wp, "review")
+        else:
+            wpfile.set_status(wp, "review")
         report += "\nStatus set to review."
     if passed:
         # The fingerprint ties the pass to the checks it ran: editing the WP's Verify or Try it, or
@@ -121,6 +181,8 @@ def checks_fingerprint(context: Context, wp: wpfile.WorkPackage, tree: Path) -> 
     inputs = {"round_checks": wp.round_checks(config["verify_round"], config["verify_workspace"]),
               "try_it": try_it_text(wp) if config["require_try_it"] else None,
               "env": session_env(context, wp.id, tree.resolve()),
+              "owns": list(wp.owns),
+              "owns_explicit": wp.owns_explicit,
               # Fixers run in their configured order, which the sorted dump below would otherwise lose.
               "autofix": list(config["autofix"].items()),
               **{key: config[key] for key in ("shell", "command_timeout_minutes", "verify_round", "verify_workspace",
@@ -131,11 +193,13 @@ def checks_fingerprint(context: Context, wp: wpfile.WorkPackage, tree: Path) -> 
 def outside_owns(context: Context, wp: wpfile.WorkPackage, tree: Path) -> list[str]:
     """Paths the tree changed outside the WP's owns (its shared files and WP file aside), unless
     they are as main has them now. Git only, so cheap to run again."""
+    if not wp.owns_explicit and not context.project.require_owns:
+        return []
     config = context.project.config
     wp_dir, main = context.project.wp_dir_relative, context.project.main_branch
     shared = [entry["path"] for entry in config["shared_files"]]
     return [path for path in changed_paths(tree, main) if not wpfile.path_owned(path.removesuffix(" (deleted)"), wp, wp_dir, shared)
-            and not wpfile.is_wp_file(path, wp_dir) and not matches_main(tree, main, path)]
+            and (wp.is_github or not wpfile.is_wp_file(path, wp_dir)) and not matches_main(tree, main, path)]
 
 
 def run_checks(context: Context, wp: wpfile.WorkPackage, tree: Path) -> tuple[bool, str]:
@@ -143,11 +207,16 @@ def run_checks(context: Context, wp: wpfile.WorkPackage, tree: Path) -> tuple[bo
     from .whats_new import try_it_problem
     config = context.project.config
     if config["require_try_it"] and (problem := try_it_problem(wp)):
-        return False, f"{problem} Then run wpo verify again."
+        hint = " Use `wpo try-it - <<'EOF'` then run `wpo verify` again." if wp.is_github else " Then run wpo verify again."
+        return False, f"{problem}{hint}"
     env = session_env(context, wp.id, tree)
     wp_dir = context.project.wp_dir_relative
     main = context.project.main_branch
-    owned = [path for path in changed_paths(tree, main) if not path.endswith(" (deleted)") and wpfile.path_owned(path, wp, wp_dir, ())]
+    shared = {entry["path"] for entry in config["shared_files"]}
+    owned = [
+        path for path in changed_paths(tree, main)
+        if not path.endswith(" (deleted)") and path not in shared and wpfile.path_owned(path, wp, wp_dir, ())
+    ]
     lines = [f"fixers: {report}" for report in run_fixers(tree, owned, configured_fixers(config), env, config["command_timeout_minutes"])]
     commands, scope_line = scoped_checks(config, tree, wp.round_checks(config["verify_round"], config["verify_workspace"]), changed_paths(tree, main))
     if config["check_scope"]:

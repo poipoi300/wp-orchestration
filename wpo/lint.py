@@ -25,13 +25,14 @@ from .context import Context
 from .similarity import SimilarityIndex
 
 REQUIRED_SECTIONS = ("Goal", "Context", "Deliverables", "Steps", "Acceptance criteria", "Verify")
+GITHUB_REQUIRED_SECTIONS = ("Goal", "Acceptance criteria")
 GLOB_CHARACTERS = re.compile(r"[*?\[]")
 NUMBERED_CRITERION = re.compile(r"^\s*\d+\.\s")
 REVERSE_ENGINEERING = re.compile(r"(?i)reverse[- ]engineer|decompil|disassembl|bytecode|ghidra|static analysis")
 METHOD_OR_CONTRACT = re.compile(r"(?i)\bmethod\b|\bcontract\b|exact[- ]shape|\binvariant\b|\bprototype\b|\bspike\b")
 # Statuses lint treats as open: a blocked WP is unblocked into the same files and the same chain.
 LINT_OPEN_STATUSES = (*wpfile.OPEN_STATUSES, "blocked")
-WP_REFERENCE = re.compile(r"\bWP-\d{3,}\b")
+WP_REFERENCE = re.compile(r"\b(?:WP|GH)-\d+\b")
 # A milestone compares with another when both are one prefix and a number (M3 < M10); others ('M?') do not.
 MILESTONE = re.compile(r"^(\D*)(\d+)$")
 RUST_MODULE_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
@@ -280,13 +281,16 @@ def lint_wp(wp: wpfile.WorkPackage, wps: dict[str, wpfile.WorkPackage], root: Pa
         findings.append(Finding(wp.id, severity, check, message))
 
     text = wp.text()
-    for heading in REQUIRED_SECTIONS:
+    required = GITHUB_REQUIRED_SECTIONS if wp.is_github else REQUIRED_SECTIONS
+    for heading in required:
         if not wpfile.section_lines(text, heading):
             add("error", CHECK_SECTIONS, f"no '## {heading}' section, or it is empty")
 
     commands = wp.verify_commands()
     if not commands:
-        if settings.round_checks:
+        if wp.is_github and settings.round_checks:
+            add("warning", CHECK_VERIFY, "the Verify block has no task-specific commands: only project round checks will run; add a '## Verify' block if scoped tests are needed")
+        elif settings.round_checks:
             add("error", CHECK_VERIFY, "the Verify block has no commands: only the round checks (format, lint) would run, so name the "
                                        "scoped tests that prove its criteria")
         else:
@@ -301,7 +305,8 @@ def lint_wp(wp: wpfile.WorkPackage, wps: dict[str, wpfile.WorkPackage], root: Pa
 
     for dependency in wp.depends_on:
         if dependency not in wps:
-            add("error", CHECK_DEPENDENCIES, f"depends on {dependency}, which has no WP file")
+            missing_kind = "does not exist" if wp.is_github else "has no WP file"
+            add("error", CHECK_DEPENDENCIES, f"depends on {dependency}, which {missing_kind}")
             continue
         other = wps[dependency]
         # A blocked WP behind a blocked one is one stalled chain, reported where it can still start.
@@ -339,6 +344,11 @@ def lint_wp(wp: wpfile.WorkPackage, wps: dict[str, wpfile.WorkPackage], root: Pa
             continue
         if reported_overlaps is not None and pair in reported_overlaps:
             continue
+        if wp.is_github and other.is_github and (not wp.owns_explicit or not other.owns_explicit):
+            if reported_overlaps is not None:
+                reported_overlaps.add(pair)
+            add("warning", CHECK_OVERLAP, f"runs concurrently with open {other.id} ({other.status}) across lanes while at least one omits '## Scope' owns paths: add '## Scope' or order them with blocked-by")
+            continue
         shared = sorted({mine for mine in wp.owns for theirs in other.owns if patterns_overlap(mine, theirs)})
         if shared:
             if reported_overlaps is not None:
@@ -354,7 +364,7 @@ def lint_wp(wp: wpfile.WorkPackage, wps: dict[str, wpfile.WorkPackage], root: Pa
 
     # Unknown dependencies are already errors above.
     stale = sorted({reference for reference in WP_REFERENCE.findall(text)
-                    if reference != wp.id and reference not in wps and reference not in wp.depends_on})
+                    if reference != wp.id and reference != wp.legacy_wp_id and reference not in wps and reference not in wp.depends_on})
     if stale:
         add("warning", CHECK_STALE_REFERENCE, f"names {', '.join(stale)}, which {'has' if len(stale) == 1 else 'have'} no WP file "
                                               "(renumbered, merged into another, or a typo?)")
@@ -384,7 +394,8 @@ def lint_targets(wps: dict[str, wpfile.WorkPackage], wp_ids: list[str], include_
 def lint_all(context: Context, wp_ids: list[str], include_done: bool = False) -> tuple[list[Finding], SimilarityIndex | None, dict[str, wpfile.WorkPackage]]:
     """`lint`, also returning the similarity index and the WPs it read, for reports that list pairs."""
     wps = {wp.id: wp for wp in context.effective_wps()}
-    targets = lint_targets(wps, wp_ids, include_done)
+    normalized_ids = [context.normalize_id(wp_id) for wp_id in wp_ids]
+    targets = lint_targets(wps, normalized_ids, include_done)
     settings = LintSettings.from_config(context.project.config)
     similarity = SimilarityIndex.of_wps(wps.values()) if settings.similarity_warn is not None else None
     reported_overlaps: set[frozenset[str]] = set()

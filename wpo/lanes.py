@@ -104,7 +104,12 @@ def lane_outcome(context: Context, lane: str, wps: list[wpfile.WorkPackage], mer
     if lane in pool_lanes(context):
         return "starting the pool", ids
     from .continuous import block_reason
-    runnable = [wp.id for wp in wps if set(wp.depends_on) <= merged and not block_reason(context, wp.id)]
+    runnable = [
+        wp.id for wp in wps
+        if set(wp.depends_on) <= merged
+        and not any(sub not in merged for sub in getattr(wp, "sub_issues", ()))
+        and not block_reason(context, wp.id)
+    ]
     if not runnable:
         return f"waiting on dependencies ({', '.join(ids)})", None
     if context.project.lane(lane).get("builds_in_pool"):
@@ -282,7 +287,20 @@ def board(context: Context) -> list[str]:
     for milestone in milestones:
         counts = [sum(1 for wp in wps if wp.milestone == milestone and wp.status == status) for status in STATUS_ORDER]
         lines.append(f"| {milestone} | " + " | ".join(map(str, counts)) + " |")
-    ready = [wp.id for wp in wps if wp.status in ("todo", "changes_requested") and set(wp.depends_on) <= merged]
+    ready = [wp.id for wp in wps if wp.status in ("todo", "changes_requested") and set(wp.depends_on) <= merged
+             and not any(sub not in merged for sub in getattr(wp, "sub_issues", ()))]
+    if context.project.is_github:
+        lines += ["", f"**Ready to start:** {', '.join(ready) or 'none'}", "",
+                  "| Issue | Title | Milestone | Lane | Status | PR | Depends on | Builder | Latest progress |",
+                  "|---|---|---|---|---|---|---|---|---|"]
+        for wp in wps:
+            latest = wp.latest_progress().replace("|", "/")
+            pr_col = ""
+            if wp.pr and wp.pr.get("number"):
+                pr_tag = "merged" if wp.pr.get("merged") else ("auto-merge" if wp.pr.get("auto_merge") else str(wp.pr.get("state") or "open").lower())
+                pr_col = f"#{wp.pr['number']} ({pr_tag})"
+            lines.append(f"| {wp.id} | {wp.title} | {wp.milestone} | {wp.lane} | {wp.status} | {pr_col} | {', '.join(wp.depends_on)} | {wp.builder} | {latest} |")
+        return lines
     lines += ["", f"**Ready to start:** {', '.join(ready) or 'none'}", "",
               "| WP | Title | Milestone | Lane | Status | Depends on | Builder | Latest progress |", "|---|---|---|---|---|---|---|---|"]
     for wp in wps:

@@ -863,8 +863,12 @@ def _run_attempt(context: Context, route: dict, prompt: str, log_path: Path, set
     allowed = list(settings.write_paths)
     if settings.access == "builder" and wp_id:
         wp = context.wp_in_tree(wp_id, settings.cwd)
-        allowed = list(dict.fromkeys([*allowed, *wp.owns, f"{context.project.wp_dir_relative}/{wp.file_name}",
-                                     *(entry["path"] for entry in context.project.config["shared_files"])]))
+        if wp.is_github:
+            own_paths = wp.owns if wp.owns_explicit else ["**"]
+            allowed = list(dict.fromkeys([*allowed, *own_paths, *(entry["path"] for entry in context.project.config["shared_files"])]))
+        else:
+            allowed = list(dict.fromkeys([*allowed, *wp.owns, f"{context.project.wp_dir_relative}/{wp.file_name}",
+                                         *(entry["path"] for entry in context.project.config["shared_files"])]))
     prompt_text += (f"\n\nWPO access contract: access={settings.access}; writable repository paths={json.dumps(allowed)}. "
                     "read/reviewer access permits NO file edits; evaluator/docs/worker access permits ONLY the listed paths. "
                     f"Additional configured session directories={json.dumps(context.project.config['session_dirs'])}; "
@@ -909,7 +913,7 @@ def _run_attempt(context: Context, route: dict, prompt: str, log_path: Path, set
                             "cwd": str(settings.cwd), "access": settings.access, "write_paths": allowed, "before_tree": before_tree,
                             "resume_session": resume_session, "stop_on_compaction": settings.stop_on_compaction,
                             "idle_minutes": settings.idle_minutes, "heartbeat_file": str(log_path.parent / "heartbeat"),
-                            "progress_file": str(context.wp_in_tree(wp_id, settings.cwd).path) if wp_id else None},
+                            "progress_file": str(context.project.wp_run_dir(wp_id) / "state.json") if (wp_id and context.project.is_github) else (str(context.wp_in_tree(wp_id, settings.cwd).path) if wp_id else None)},
                             bridge.coordinator_for(wp_id), publishing)
     write_json(identity_path, {"version": 1, "env": {**identity, "WPO_T3_REQUEST_ID": request["id"]}, "project": str(context.project.root)})
     if not log_path.exists():
@@ -929,8 +933,7 @@ def _run_attempt(context: Context, route: dict, prompt: str, log_path: Path, set
             # lead's runner blocks the WP once its workers are stopped.
             error.stalled_wp = wp_id
         elif wp_id:
-            from . import wpfile
-            wpfile.set_status(context.wp_in_tree(wp_id, settings.cwd), "blocked")
+            context.set_wp_status(context.wp_in_tree(wp_id, settings.cwd), "blocked")
             context.journal.emit("wp-blocked", str(error), {"wp": wp_id})
         raise
     finally:
@@ -1044,10 +1047,9 @@ def finish_attempt(context: Context, request: dict, on_finished=None, recovery: 
                 violation += (f" Its completion snapshot failed ({completed.get('completed_changes_error')}); "
                               "checked against the checkout as it is now.")
             if violation and wp_id:
-                from . import wpfile
                 wp = context.wp_in_tree(wp_id, Path(payload["cwd"]))
                 if wp.status != "blocked":
-                    wpfile.set_status(wp, "blocked")
+                    context.set_wp_status(wp, "blocked")
                     context.journal.emit("wp-blocked", violation, {"wp": wp_id})
             if violation:
                 disposition = "scope_violation"

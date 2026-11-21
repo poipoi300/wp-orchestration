@@ -34,7 +34,7 @@ from pathlib import Path
 from . import wpfile
 from .commands import run_commands
 from .context import Context
-from .integrate import EXIT_MEANINGS, EXIT_MERGED
+from .integrate import EXIT_MEANINGS, EXIT_MERGED, EXIT_PR_OPENED
 from .platform import FileLock, NamedMutex, spawn_detached
 from .project import git
 from .routing import with_mode, wp_mode
@@ -80,6 +80,7 @@ class Supervisor:
         # orchestrator unblocks or resets becomes runnable again.
         self.finished: dict[str, str] = {}
         self.integration_failed: set[str] = set()
+        self.open_pr_heads: dict[str, str] = {}
         self.no_route_reported_for: str | None = None
         # WPs a pool lane gave back to their own lane; it does not pick them again.
         self.handed_back: set[str] = set()
@@ -145,7 +146,8 @@ class Supervisor:
         # While its own lane waits for a hosted route, the pool's model is the faster way forward.
         sole_blockers -= {wp_id for wp_id in sole_blockers if self.waiting_for_route(wp_id)}
         eligible = [wp for wp in effective if wp.status in POOL_STATUSES and wp.id not in sole_blockers and wp.lane not in holds
-                    and wp.id not in self.handed_back and set(wp.depends_on) <= merged and not self.escalation(wp.id)]
+                    and wp.id not in self.handed_back and set(wp.depends_on) <= merged and not self.escalation(wp.id)
+                    and not any(sub not in merged for sub in getattr(wp, "sub_issues", ()))]
         live = {lane for lane in {wp.lane for wp in eligible if wp.lane} if supervisor_pid(self.context, lane)}
         return sorted(eligible, key=lambda wp: (wp.id in depended_on, wp.lane in live, wp.milestone, wp.id))
 
@@ -178,6 +180,8 @@ class Supervisor:
             candidates = effective
         for wp in candidates:
             if not self.selected(wp) or self.finished.get(wp.id) == wp.status or wp.status not in RESUMABLE_STATUSES:
+                continue
+            if any(sub not in merged for sub in getattr(wp, "sub_issues", ())):
                 continue
             if not set(wp.depends_on) <= merged:
                 continue
@@ -261,7 +265,7 @@ class Supervisor:
             return worktree
         worktree = self.project.worktree(wp_id)
         if worktree.exists():
-            if not list(self.project.wp_dir(worktree).glob(f"{wp_id}-*.md")):
+            if not self.project.is_github and not list(self.project.wp_dir(worktree).glob(f"{wp_id}-*.md")):
                 # Created before its WP file reached main (a draft committed later): catch up.
                 git(worktree, "merge", "--ff-only", "--quiet", self.project.main_branch)
                 self.log(f"fast-forwarded {worktree} to main for its WP file")
@@ -286,7 +290,15 @@ class Supervisor:
         meaning = EXIT_MEANINGS.get(code, "wpo integrate failed")
         self.log(f"{wp_id} integration exit {code}: {meaning}")
         if code == EXIT_MERGED:
+            self.open_pr_heads.pop(wp_id, None)
             self.emit("wp-merged", f"{wp_id} merged into main", wp=wp_id)
+            return True
+        if code == EXIT_PR_OPENED:
+            wt = self.project.worktree(wp_id)
+            if wt.exists():
+                head = git(wt, "rev-parse", "HEAD", check=False).stdout.strip()
+                if head:
+                    self.open_pr_heads[wp_id] = head
             return True
         self.emit("integration-failed", f"{wp_id} could not merge into main: {meaning} (exit {code}); its worktree is left for the orchestrator", wp=wp_id)
         self.integration_failed.add(wp_id)
@@ -450,27 +462,72 @@ class Supervisor:
 
     # -------------------------------------------------------------------------------------- loop
 
+    def _pr_already_current(self, wp: wpfile.WorkPackage) -> bool:
+        """Whether `wp` already has an open PR matching its worktree's clean HEAD."""
+        if not wp.pr or wp.pr.get("state") != "OPEN":
+            return False
+        wt = self.project.worktree(wp.id)
+        if not wt.exists():
+            return True
+        if git(wt, "status", "--porcelain", check=False).stdout.strip():
+            return False
+        head = git(wt, "rev-parse", "HEAD", check=False).stdout.strip()
+        recorded = wp.pr.get("head_sha") or self.open_pr_heads.get(wp.id)
+        return bool(head and recorded and head == recorded)
+
+    def _awaiting_automerge_prs(self, effective: list[wpfile.WorkPackage], merged: set[str]) -> list[wpfile.WorkPackage]:
+        """Open PRs with auto-merge armed (or direct-merge fallback) that belong to this lane or
+        block a selected WP in this lane, and have not failed CI checks."""
+        if not self.project.is_github:
+            return []
+        direct_fallback = self.project.delivery_mode == "pr-automerge" and str(self.project.github_config.get("auto_merge_fallback") or "wait") == "direct-merge"
+        by_id = {wp.id: wp for wp in effective}
+        watched_ids = {wp.id for wp in effective if self.selected(wp)}
+        for wp in effective:
+            if self.selected(wp) and wp.status in RESUMABLE_STATUSES:
+                watched_ids.update(dep for dep in wp.depends_on if dep not in merged)
+        waiting: list[wpfile.WorkPackage] = []
+        for wp_id in sorted(watched_ids):
+            wp = by_id.get(wp_id)
+            if wp is None or wp.is_merged or not wp.pr or wp.pr.get("state") != "OPEN":
+                continue
+            if wp.pr.get("check_state") in ("FAILURE", "ERROR") or wp.pr.get("merge_state_status") == "DIRTY":
+                continue
+            if wp.pr.get("auto_merge") or direct_fallback:
+                waiting.append(wp)
+        return waiting
+
     def loop(self) -> None:
         while True:
             from .continuous import block_reason
-            # A WP that finished but did not merge (a conflict since resolved, an interrupted
-            # supervisor) is merged before new work starts. A WP committed as done on main is
-            # settled (by its integration, or by the orchestrator through `wpo commit-main`):
-            # under T3 its checkout outlives the merge, so the checkout alone does not mean unmerged.
-            # Main is read again each pass, since this lane's own merges move it.
-            main_copies = self.context.main_wps()
+            if self.project.is_github:
+                from .github import GhError, reconcile_open_prs
+                try:
+                    reconcile_open_prs(self.context, force_sync=True)
+                except GhError as error:
+                    self.log(f"GitHub sync failed: {error}")
+            main_copies = self.context.main_wps(read_only=self.project.is_github)
             merged = self.context.merged_done_ids(main_copies)
-            for wp in self.context.effective_wps(main_copies):
+            effective = self.context.effective_wps(main_copies)
+            for wp in effective:
                 if (wp.status == "done" and wp.id not in merged and not block_reason(self.context, wp.id)
                         and self.selected(wp) and wp.id not in self.integration_failed
+                        and not self._pr_already_current(wp)
                         and self.project.worktree(wp.id).exists() and self.settled_for_integration(wp)):
                     self.integrate(wp.id)
             picked = self.next_wp()
             if picked is None:
-                if not self.is_pool:
-                    return
-                self.sleep_until(datetime.now(timezone.utc) + POOL_IDLE_RECHECK, "no WP the pool may build")
-                continue
+                if self.is_pool:
+                    self.sleep_until(datetime.now(timezone.utc) + POOL_IDLE_RECHECK, "no WP the pool may build")
+                    continue
+                if awaiting := self._awaiting_automerge_prs(effective, merged):
+                    poll = max(5.0, float(self.project.github_config.get("poll_seconds") or 60))
+                    names = ", ".join(f"{wp.id} (PR #{wp.pr['number']})" for wp in awaiting if wp.pr)
+                    self.set_state("sleeping")
+                    self.sleep_until(datetime.now(timezone.utc) + timedelta(seconds=poll), f"waiting for auto-merge: {names}")
+                    self.take_lane_slot()
+                    continue
+                return
             wp, claim = picked
             try:
                 wake_at = self.run_claimed(wp)

@@ -27,8 +27,8 @@ from . import wpfile
 COMPARED_SECTIONS = ("Goal", "Deliverables", "Acceptance criteria")
 TITLE_WEIGHT = 2
 TOKEN = re.compile(r"[a-z][a-z0-9_]*[a-z0-9]")
-# WP ids and the per-WP install-test prefixes (`wp0904_`) name a WP, not a topic.
-ID_TOKEN = re.compile(r"^wp\d+[a-z0-9_]*$")
+# WP/GH ids and the per-WP install-test prefixes (`wp0904_`) name a work item, not a topic.
+ID_TOKEN = re.compile(r"^(?:wp|gh)\d+[a-z0-9_]*$")
 MINIMUM_TOKEN_LENGTH = 3
 STOPWORDS = frozenset("""
 a about above after again against all also am an and any are as at be because been before being below between both
