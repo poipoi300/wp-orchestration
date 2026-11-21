@@ -481,9 +481,10 @@ def builder_rules(context: Context, wp: wpfile.WorkPackage, lead: bool) -> str:
     environment = "".join(f"\n  - {line}" for line in context.project.config["environment"])
     environment = f"\n- This machine (known facts; do not spend turns re-discovering them):{environment}" if environment else ""
     try_it_rule = (
-        f"- Before finishing, record the '## {TRY_IT_SECTION}' instructions with `wpo try-it - <<'EOF'` (a fenced block of the exact\n"
-        f"  commands the user runs from the main checkout once this is merged, and what to look for; or, when nothing can be tried by\n"
-        f"  hand, a line starting '{NOTHING_TO_TRY}' saying why). It goes into the PR body—keep secrets and personal paths out of it."
+        f"- Before finishing, record the '## {TRY_IT_SECTION}' instructions with `wpo try-it --file <path> --remove` (write multiline\n"
+        f"  fenced commands to a scratch file, or use `wpo try-it - <<'EOF'` / `wpo try-it '<single line>'`): exact commands the user\n"
+        f"  runs from the main checkout once merged and what to look for, or a line starting '{NOTHING_TO_TRY}' saying why. It goes\n"
+        f"  into the PR body—keep secrets and personal paths out of it."
         if wp.is_github else
         f"- Before finishing, fill the '## {TRY_IT_SECTION}' section (add it before '## Handoff' if missing): a fenced block of the exact\n"
         f"  commands the user runs from the main checkout once this is merged, and what to look for; or, when nothing can be tried by\n"
@@ -1672,16 +1673,18 @@ class WorkPackageEnded(Exception):
 
 def run_wp(context: Context, wp_id: str, tree: Path, options: RunOptions) -> int:
     """Runs a WP; returns 0, or EXIT_NO_ROUTE when no route could serve a session."""
+    from . import run_state
     from .artifacts import space_problem
     wp_id = context.normalize_id(wp_id)
-    if problem := space_problem(context.project, tree):
-        context.set_wp_status(context.wp_in_tree(wp_id, tree), "blocked")
-        context.journal.emit("wp-blocked", f"{wp_id}: {problem}", {"wp": wp_id})
-        print(problem)
+    with run_state.ledger_writer(context.project, "run", wp_id):
+        if problem := space_problem(context.project, tree):
+            context.set_wp_status(context.wp_in_tree(wp_id, tree), "blocked")
+            context.journal.emit("wp-blocked", f"{wp_id}: {problem}", {"wp": wp_id})
+            print(problem)
+            return 0
+        try:
+            WorkPackageRun(context, wp_id, tree, options).run()
+        except RunStopped as stopped:
+            print(f"run stopped: {stopped}")
+            return EXIT_NO_ROUTE
         return 0
-    try:
-        WorkPackageRun(context, wp_id, tree, options).run()
-    except RunStopped as stopped:
-        print(f"run stopped: {stopped}")
-        return EXIT_NO_ROUTE
-    return 0

@@ -87,21 +87,23 @@ def dispatch_session(context: Context, tier: str, prompt: str, access: str, writ
 def dispatch(context: Context, tier: str, name: str, prompt: str, access: str, write_paths: list[str], families: list[str], cwd: Path | None) -> int:
     """Sends one self-contained task (drafting, research, triage) to whatever serves its tier;
     journals dispatch-done or dispatch-failed and prints the answer."""
-    run_dir = context.project.runs_dir / "dispatch" / f"{name}-{datetime.now():%Y%m%d-%H%M%S}"
-    try:
-        result = dispatch_session(context, tier, prompt, access, write_paths, families, cwd or context.project.root, run_dir, {"dispatch": name})
-    except NoRouteError as error:
-        context.journal.emit("dispatch-failed", f"{name} ({tier}): {error}; next route at {describe_next(error.next_available_at)}", {"dispatch": name})
-        print(f"NO ROUTE for {tier}; next route at {describe_next(error.next_available_at)}\n{error}")
-        return EXIT_NO_ROUTE
-    except Exception as error:
-        context.journal.emit("dispatch-failed", f"{name} ({tier}): {type(error).__name__}: {error}", {"dispatch": name})
-        raise
-    result_path = run_dir / "result.md"
-    context.journal.emit("dispatch-done", f"{name} ({tier}) finished on {result.route['id']}{result.fallback_note}; result {result_path}",
-                         {"dispatch": name, "route": result.route["id"]})
-    print(f"route: {result.route['id']} (score {result.route['score']}){result.fallback_note}\nresult: {result_path}\n\n{result.result_text}")
-    return 0
+    from . import run_state
+    with run_state.ledger_writer(context.project, "dispatch", name):
+        run_dir = context.project.runs_dir / "dispatch" / f"{name}-{datetime.now():%Y%m%d-%H%M%S}"
+        try:
+            result = dispatch_session(context, tier, prompt, access, write_paths, families, cwd or context.project.root, run_dir, {"dispatch": name})
+        except NoRouteError as error:
+            context.journal.emit("dispatch-failed", f"{name} ({tier}): {error}; next route at {describe_next(error.next_available_at)}", {"dispatch": name})
+            print(f"NO ROUTE for {tier}; next route at {describe_next(error.next_available_at)}\n{error}")
+            return EXIT_NO_ROUTE
+        except Exception as error:
+            context.journal.emit("dispatch-failed", f"{name} ({tier}): {type(error).__name__}: {error}", {"dispatch": name})
+            raise
+        result_path = run_dir / "result.md"
+        context.journal.emit("dispatch-done", f"{name} ({tier}) finished on {result.route['id']}{result.fallback_note}; result {result_path}",
+                             {"dispatch": name, "route": result.route["id"]})
+        print(f"route: {result.route['id']} (score {result.route['score']}){result.fallback_note}\nresult: {result_path}\n\n{result.result_text}")
+        return 0
 
 
 def commit_main(context: Context, message: str, paths: list[str]) -> int:

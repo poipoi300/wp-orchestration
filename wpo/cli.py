@@ -41,8 +41,22 @@ def command_names() -> frozenset[str]:
                      for name in action.choices)
 
 
+def _disable_abbrev(parser: argparse.ArgumentParser) -> None:
+    """Recursively disables argparse prefix abbreviations on the root parser and every subparser (A38)."""
+    parser.allow_abbrev = False
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            for sub in action.choices.values():
+                if isinstance(sub, argparse.ArgumentParser):
+                    _disable_abbrev(sub)
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="wpo", description="Parallel work-package orchestration on git worktrees (SKILL.md).")
+    parser = argparse.ArgumentParser(
+        prog="wpo",
+        description="Parallel work-package orchestration on git worktrees (SKILL.md).",
+        allow_abbrev=False,
+    )
     parser.add_argument("--project", type=Path, help="any directory inside the project's repository (default: the working directory)")
     parser.add_argument("--session", help="T3 bridge session identity (provided in native task prompts)")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -176,12 +190,16 @@ def build_parser() -> argparse.ArgumentParser:
     progress.add_argument("--step", type=int, help="tick this step's checkbox (1 is the first step)")
     progress.add_argument("message", help="what was done; what is next; blockers")
     commands.add_parser("verify", help="(in a WP session) apply the fixers, run the WP's Verify commands and owns check; print what failed")
-    try_it_cmd = commands.add_parser("try-it", help="(in a WP session) record the '## Try it' instructions (text, or - to read from stdin)")
-    try_it_cmd.add_argument("text")
+    try_it_cmd = commands.add_parser("try-it", help="(in a WP session) record the '## Try it' instructions (text, -, or --file PATH)")
+    try_it_cmd.add_argument("text", nargs="?")
+    try_it_cmd.add_argument("--file", type=Path, dest="input_file", help="read Try it text from this file (sandbox-safe for multiline input)")
+    try_it_cmd.add_argument("--remove", action="store_true", help="delete --file after recording its contents")
     block_cmd = commands.add_parser("block", help="(in a WP session) mark the work item blocked and log why")
     block_cmd.add_argument("reason")
-    handoff = commands.add_parser("handoff", help="(in a WP builder session) hand the work to a fresh session: the handoff text, or - to read it from stdin")
-    handoff.add_argument("text")
+    handoff = commands.add_parser("handoff", help="(in a WP builder session) hand the work to a fresh session (text, -, or --file PATH)")
+    handoff.add_argument("text", nargs="?")
+    handoff.add_argument("--file", type=Path, dest="input_file", help="read handoff text from this file (sandbox-safe for multiline input)")
+    handoff.add_argument("--remove", action="store_true", help="delete --file after recording its contents")
     finding = commands.add_parser("finding", help="(in a WP session) answer an open BLOCKING review finding")
     finding_commands = finding.add_subparsers(dest="finding_command", required=True)
     fixed = finding_commands.add_parser("fixed", help="the finding is fixed")
@@ -300,6 +318,22 @@ def build_parser() -> argparse.ArgumentParser:
     ledger_override.add_argument("--mode", choices=("single", "staged"), help="local execution mode")
     ledger_override.add_argument("--skills", action="append", help="local skills list, comma-separated or repeatable")
     ledger_override.add_argument("--clear", action="append", default=[], help="override key(s) to clear")
+    ledger_approve = ledger_sub.add_parser(
+        "approve-verify",
+        help="locally authorize a GitHub issue's '## Verify' commands bound to its current reviewed body revision",
+    )
+    ledger_approve.add_argument("wp", help="work item id (e.g. GH-42 or 42)")
+    ledger_approve.add_argument("--clear", action="store_true", help="revoke local Verify command authorization for this issue")
+    ledger_approve.add_argument("--no-refresh", action="store_true", help="use the cached issue body without syncing GitHub first")
+    ledger_approve.add_argument("--json", action="store_true")
+    ledger_hooks = ledger_sub.add_parser(
+        "hooks",
+        help="inspect or reconcile interrupted post-merge hook journal entries",
+    )
+    hooks_action = ledger_hooks.add_mutually_exclusive_group()
+    hooks_action.add_argument("--mark-done", metavar="KEY", help="mark an interrupted hook entry done after manual reconciliation")
+    hooks_action.add_argument("--retry", metavar="KEY", help="clear an interrupted hook entry so the next reconcile runs it again")
+    ledger_hooks.add_argument("--json", action="store_true")
 
     commands.add_parser("install-shim", help="put the `wpo` command on PATH")
     init = commands.add_parser("init", help="add .orchestration/ to a repository (GitHub + external private ledger by default)")
@@ -317,6 +351,7 @@ def build_parser() -> argparse.ArgumentParser:
                              help="store private transcripts/runs outside the git repository (default for GitHub)")
     init_ledger.add_argument("--keep-repo-ledger", action="store_false", dest="external_ledger",
                              help="store runs under .orchestration/runs/ inside the checkout (default for --wp-files)")
+    _disable_abbrev(parser)
     return parser
 
 
@@ -546,14 +581,56 @@ def main(argv: list[str] | None = None) -> int:
             if arguments.command == "log":
                 print(log(context, arguments.message, arguments.step))
                 return 0
-            if arguments.command == "try-it":
-                print(try_it(context, sys.stdin.read() if arguments.text == "-" else arguments.text))
+            if arguments.command in ("try-it", "handoff"):
+                from .session_commands import session_wp
+                if arguments.input_file is not None:
+                    wp_obj, wp_tree = session_wp(context)
+                    raw_input = arguments.input_file
+                    candidate = raw_input if raw_input.is_absolute() else (Path.cwd() / raw_input)
+                    if not candidate.is_file():
+                        raise SessionCommandError(f"{arguments.command} file not found: {raw_input}")
+                    resolved = candidate.resolve()
+                    tree_root = wp_tree.resolve()
+                    run_root = context.project.wp_run_dir(wp_obj.id).resolve()
+                    if not (resolved.is_relative_to(tree_root) or resolved.is_relative_to(run_root)):
+                        raise SessionCommandError(f"{arguments.command} --file must be inside the session worktree or run directory: {raw_input}")
+                    if arguments.remove:
+                        from .project import git as git_cmd
+                        if not resolved.is_relative_to(tree_root):
+                            raise SessionCommandError(f"{arguments.command} --remove only deletes non-symlink scratch files inside the session worktree")
+                        # Walk every component from `candidate` up to `tree_root` to refuse symlinks.
+                        probe = candidate
+                        while True:
+                            if probe.is_symlink():
+                                raise SessionCommandError(f"{arguments.command} --remove refused on symlink path: {raw_input}")
+                            if probe == tree_root or probe.parent == probe:
+                                break
+                            try:
+                                if probe.resolve() == tree_root:
+                                    break
+                            except OSError:
+                                break
+                            probe = probe.parent
+                        rel_parts = resolved.relative_to(tree_root).parts
+                        if any(part.lower() in (".git", ".agents", ".orchestration", ".claude", ".codex") for part in rel_parts):
+                            raise SessionCommandError(f"{arguments.command} --remove refused on protected path: {raw_input}")
+                        rel_posix = resolved.relative_to(tree_root).as_posix()
+                        tracked = git_cmd(tree_root, "ls-files", "--error-unmatch", "--", rel_posix, check=False)
+                        if tracked.returncode == 0:
+                            raise SessionCommandError(f"{arguments.command} --remove refused on git-tracked file: {rel_posix}")
+                    content = resolved.read_text(encoding="utf-8")
+                    result_msg = try_it(context, content) if arguments.command == "try-it" else handoff(context, content)
+                    if arguments.remove:
+                        resolved.unlink(missing_ok=True)
+                    print(result_msg)
+                elif arguments.text is None:
+                    raise SessionCommandError(f"provide {arguments.command} text, '-', or --file <path>")
+                else:
+                    raw_text = sys.stdin.read() if arguments.text == "-" else arguments.text
+                    print(try_it(context, raw_text) if arguments.command == "try-it" else handoff(context, raw_text))
                 return 0
             if arguments.command == "block":
                 print(block(context, arguments.reason))
-                return 0
-            if arguments.command == "handoff":
-                print(handoff(context, sys.stdin.read() if arguments.text == "-" else arguments.text))
                 return 0
             passed, report = verify(context)
         except SessionCommandError as error:
@@ -639,6 +716,10 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"  In-flight worktrees preserved: {', '.join(report['in_flight_worktrees'])}")
             if report["uncommitted_drafts"]:
                 print(f"  Uncommitted drafts skipped (commit first if needed): {', '.join(report['uncommitted_drafts'])}")
+            if report.get("active_writers"):
+                print("  ACTIVE WRITERS (stop/wrap-up before --apply):")
+                for writer in report["active_writers"]:
+                    print(f"    - {writer}")
             if report["privacy_violations"]:
                 print("  PRIVACY VIOLATIONS (must resolve before --apply):")
                 for wp_id, issues in sorted(report["privacy_violations"].items()):
@@ -685,6 +766,50 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"Pruned {report['removed_files']} raw transcript file(s) ({report['removed_bytes']:,} bytes); usage index preserved.")
             else:
                 print(f"Dry run (pass --apply to remove): {report['candidate_files']} raw transcript file(s) ({report['candidate_bytes']:,} bytes) older than {arguments.older_than_days:g} days.")
+            return 0
+        if arguments.ledger_command == "approve-verify":
+            from .github import GhError
+            if not context.project.is_github or context.tracker is None:
+                print("ledger approve-verify: only applies to GitHub-tracked projects", file=sys.stderr)
+                return 2
+            wp_id = context.normalize_id(arguments.wp)
+            try:
+                result = context.tracker.approve_verify(wp_id, clear=arguments.clear, refresh=not arguments.no_refresh)
+            except GhError as error:
+                print(f"ledger approve-verify: {error}", file=sys.stderr)
+                return 2
+            if arguments.json:
+                print(json.dumps(result, indent=2))
+            elif result["approved"]:
+                cmds = ", ".join(result["commands"]) or "(none)"
+                print(f"Authorized Verify commands for {result['wp']} (body {result['body_sha256'][:12]}): {cmds}")
+            else:
+                print(f"Revoked local Verify command authorization for {result['wp']}.")
+            return 0
+        if arguments.ledger_command == "hooks":
+            from .github import GhError, reconcile_hook_journal
+            action = "mark-done" if arguments.mark_done else ("retry" if arguments.retry else "list")
+            key = arguments.mark_done or arguments.retry
+            try:
+                result = reconcile_hook_journal(context.project.runs_dir, key=key, action=action)
+            except GhError as error:
+                print(f"ledger hooks: {error}", file=sys.stderr)
+                return 2
+            if arguments.json:
+                print(json.dumps(result, indent=2))
+            elif action == "list":
+                entries = result["entries"]
+                if not entries:
+                    print("No post-merge hook journal entries.")
+                else:
+                    for entry_key, entry in sorted(entries.items()):
+                        status = entry.get("status", "unknown") if isinstance(entry, dict) else "unknown"
+                        wp_tag = entry.get("wp", "-") if isinstance(entry, dict) else "-"
+                        print(f"  [{status}] {wp_tag}: {entry_key}")
+            elif action == "mark-done":
+                print(f"Marked post-merge hook done: {key}")
+            else:
+                print(f"Cleared post-merge hook entry for retry: {key}")
             return 0
         wp_id = context.normalize_id(arguments.wp)
         run_dir = context.project.wp_run_dir(wp_id)
@@ -860,7 +985,7 @@ def main(argv: list[str] | None = None) -> int:
             tree = Bridge(context).ensure_workspace(wp_id)
         options = RunOptions(arguments.builder, arguments.reviewer, tuple(split_list(arguments.families)), arguments.idle_minutes, arguments.lane)
         code = run_wp(context, wp_id, tree.resolve(), options)
-        write_board(context)
+        write_board(context, write_repo_file=not context.project.is_github)
         return code
 
     if arguments.command == "delegate":
@@ -893,7 +1018,7 @@ def main(argv: list[str] | None = None) -> int:
         wp_id = context.normalize_id(arguments.wp)
         code = integrate(context, wp_id, arguments.verify)
         print(f"{wp_id}: {EXIT_MEANINGS.get(code, 'failed')} (exit {code})")
-        write_board(context)
+        write_board(context, write_repo_file=not context.project.is_github)
         return code
 
     if arguments.command == "lanes":

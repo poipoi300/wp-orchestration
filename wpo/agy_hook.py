@@ -39,6 +39,10 @@ COMMAND_CHARACTERS = re.compile(r"[A-Za-z0-9_\-./\\:=,+@ '\"*]*")
 PROGRESS_LOG_COMMAND = re.compile(r"wpo log(?: --step [0-9]+)? '[^'\r\n]*'")
 # An answer to a review finding carries free text the same way.
 FINDING_ANSWER_COMMAND = re.compile(r"wpo finding (?:fixed R[0-9]+-F[0-9]+|veto R[0-9]+-F[0-9]+ [a-z-]+) '[^'\r\n]*'")
+# `wpo block` and single-line `wpo try-it` carry single-quoted free text the same way; multiline
+# Try it / Handoff use `--file <repo-relative-path>` which passes the standard command check.
+BLOCK_FREE_TEXT_COMMAND = re.compile(r"wpo block '[^'\r\n]*'")
+TRY_IT_FREE_TEXT_COMMAND = re.compile(r"wpo try-it '[^'\r\n]*'")
 # Spellings Windows resolves to another name that the file system cannot resolve for us first:
 # streams (a:b), wildcards, percent escapes, and components ending in a dot or a space (".git."
 # opens ".git"). 8.3 short names (AGENTS~1) need no rule: resolving an existing one yields the long
@@ -160,8 +164,10 @@ def decide_command(policy: dict, root: str, command: str, cwd: object) -> tuple[
     """A chain ('&&' or ';' between commands) is allowed when every command in it is: sessions are
     asked to batch, and each part passes the same checks as a lone command."""
     parts = CHAIN_SEPARATOR.split(command.strip())
-    # A Progress log message is free text and may hold a ';' inside its quotes.
-    if len(parts) == 1 or PROGRESS_LOG_COMMAND.fullmatch(command.strip()) or FINDING_ANSWER_COMMAND.fullmatch(command.strip()):
+    # Single-quoted free-text WPO commands may hold a ';' inside their quotes.
+    stripped = command.strip()
+    if (len(parts) == 1 or PROGRESS_LOG_COMMAND.fullmatch(stripped) or FINDING_ANSWER_COMMAND.fullmatch(stripped)
+            or BLOCK_FREE_TEXT_COMMAND.fullmatch(stripped) or TRY_IT_FREE_TEXT_COMMAND.fullmatch(stripped)):
         return decide_single_command(policy, root, command, cwd)
     for part in parts:
         decision, reason = decide_single_command(policy, root, part, cwd)
@@ -182,6 +188,14 @@ def decide_single_command(policy: dict, root: str, command: str, cwd: object) ->
         if cwd and inside(resolve(str(cwd), root), root) is None:
             return "deny", "commands run inside the repository"
         return "allow", "an answer to a review finding"
+    if "wpo block" in policy["command_prefixes"] and BLOCK_FREE_TEXT_COMMAND.fullmatch(command):
+        if cwd and inside(resolve(str(cwd), root), root) is None:
+            return "deny", "commands run inside the repository"
+        return "allow", "a block reason"
+    if "wpo try-it" in policy["command_prefixes"] and TRY_IT_FREE_TEXT_COMMAND.fullmatch(command):
+        if cwd and inside(resolve(str(cwd), root), root) is None:
+            return "deny", "commands run inside the repository"
+        return "allow", "a Try it note"
     if not COMMAND_CHARACTERS.fullmatch(command):
         return "deny", ("commands may use only letters, digits, spaces, quotes and _ - . / \\ : = , + @ *; no shell operators, "
                         "substitutions, variables or line breaks")
@@ -196,14 +210,58 @@ def decide_single_command(policy: dict, root: str, command: str, cwd: object) ->
         flag = argument.split("=", 1)[0]
         if flag in denied:
             return "deny", f"{all_words[0]} {flag} is not allowed here (it redirects output, changes directory, loads configuration or runs other programs)"
+    base_dir = root
+    if cwd:
+        resolved_cwd = resolve(str(cwd), root)
+        if inside(resolved_cwd, root) is None:
+            return "deny", "commands run inside the repository"
+        base_dir = resolved_cwd
     directories = readable_dirs(policy, root)
     for argument in arguments:
         value = argument.split("=", 1)[-1]
-        if re.match(r"^([A-Za-z]:|/|\\)", value) or ".." in value.replace("\\", "/").split("/"):
-            if not any(inside(resolve(value, root), directory) is not None for directory in directories):
-                return "deny", f"the path {value} is outside the repository and the readable directories"
-    if cwd and inside(resolve(str(cwd), root), root) is None:
-        return "deny", "commands run inside the repository"
+        if (
+            (re.match(r"^([A-Za-z]:|/|\\)", value) or ".." in value.replace("\\", "/").split("/"))
+            and not any(inside(resolve(value, base_dir), directory) is not None for directory in directories)
+        ):
+            return "deny", f"the path {value} is outside the repository and the readable directories"
+    # `wpo try-it` / `wpo handoff`: forbid abbreviated `--file` / `--remove` prefixes (A38),
+    # validate `--file` read scope (including relative symlinks), and require write permission +
+    # non-protected path whenever `--remove` is supplied.
+    if prefix in ("wpo try-it", "wpo handoff"):
+        for argument in arguments:
+            flag = argument.split("=", 1)[0]
+            if flag.startswith("--") and (
+                (flag != "--remove" and "--remove".startswith(flag))
+                or (flag != "--file" and "--file".startswith(flag))
+            ):
+                return "deny", f"abbreviated option {flag} is not allowed for {prefix}; spell --file and --remove in full"
+        file_targets: list[str] = []
+        for idx, argument in enumerate(arguments):
+            if argument == "--file" and idx + 1 < len(arguments):
+                file_targets.append(arguments[idx + 1])
+            elif argument.startswith("--file="):
+                file_targets.append(argument.split("=", 1)[1])
+        for raw_target in file_targets:
+            resolved_target = resolve(raw_target, base_dir)
+            if not any(inside(resolved_target, directory) is not None for directory in directories):
+                return "deny", f"{prefix} --file {raw_target} is outside readable directories"
+        if "--remove" in arguments:
+            if not file_targets:
+                return "deny", f"{prefix} --remove requires --file <path>"
+            remove_protected = (*PROTECTED_NAMES, ".orchestration", ".claude", ".codex")
+            for raw_target in file_targets:
+                raw_path = Path(raw_target)
+                candidate_path = raw_path if raw_path.is_absolute() else (Path(base_dir) / raw_path)
+                if candidate_path.is_symlink():
+                    return "deny", f"{prefix} --remove refused on symlink {raw_target}"
+                relative = inside(resolve(raw_target, base_dir), root)
+                if relative is None:
+                    return "deny", f"{prefix} --remove may only delete files inside the repository, not {raw_target}"
+                if any(part.lower() in remove_protected for part in relative.split("/")):
+                    return "deny", f"{relative} is part of the repository's or the sandbox's own files"
+                if not any(glob_regex(pattern).match(relative) for pattern in policy["write_globs"]):
+                    allowed = ", ".join(policy["write_globs"]) or "nothing (read-only session)"
+                    return "deny", f"{relative} is outside this session's write paths ({allowed})"
     return "allow", "allowlisted command"
 
 

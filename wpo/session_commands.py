@@ -207,7 +207,7 @@ def run_checks(context: Context, wp: wpfile.WorkPackage, tree: Path) -> tuple[bo
     from .whats_new import try_it_problem
     config = context.project.config
     if config["require_try_it"] and (problem := try_it_problem(wp)):
-        hint = " Use `wpo try-it - <<'EOF'` then run `wpo verify` again." if wp.is_github else " Then run wpo verify again."
+        hint = " Use `wpo try-it --file <path> --remove` (or `wpo try-it - <<'EOF'`) then run `wpo verify` again." if wp.is_github else " Then run wpo verify again."
         return False, f"{problem}{hint}"
     env = session_env(context, wp.id, tree)
     wp_dir = context.project.wp_dir_relative

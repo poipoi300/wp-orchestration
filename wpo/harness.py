@@ -113,6 +113,9 @@ VERIFY_COMMAND = "wpo verify"
 # A session asks for a command its sandbox denies, and runs it once approved (approvals.py).
 APPROVAL_COMMANDS = ["wpo ask-approval", "wpo run-approved"]
 FINDING_COMMAND = "wpo finding"
+# A builder records Try it instructions or marks a GitHub-tracked task blocked.
+TRY_IT_COMMAND = "wpo try-it"
+BLOCK_COMMAND = "wpo block"
 # A builder hands its successor the state of the work (session_commands.handoff).
 HANDOFF_COMMAND = "wpo handoff"
 # The command a lead builder runs to hand tasks to workers (`wpo install-shim` puts it on PATH).
@@ -148,7 +151,8 @@ OPENCODE_FATAL_STDERR = re.compile(r"Free usage limit reached|AI_RetryError.*Fai
 
 def command_prefixes(access: str, project_config: dict, lead: bool) -> list[str]:
     if access == "builder":
-        return (list(project_config["builder_commands"]) + [LOG_COMMAND, VERIFY_COMMAND, FINDING_COMMAND, HANDOFF_COMMAND, *APPROVAL_COMMANDS]
+        return (list(project_config["builder_commands"])
+                + [LOG_COMMAND, VERIFY_COMMAND, TRY_IT_COMMAND, BLOCK_COMMAND, FINDING_COMMAND, HANDOFF_COMMAND, *APPROVAL_COMMANDS]
                 + ([DELEGATE_COMMAND] if lead else []))
     if access == "worker":
         return list(project_config["builder_commands"]) + [VERIFY_COMMAND, *APPROVAL_COMMANDS]
@@ -314,6 +318,14 @@ def agy_sandbox_note(policy: dict) -> str:
     commands = ", ".join(policy["command_prefixes"]) or "none: this session runs no commands"
     writes = ", ".join(policy["write_globs"]) or "none: this session is read-only"
     reads = ", ".join(["the repository", *policy["read_dirs"]])
+    wpo_notes: list[str] = []
+    if "wpo log" in policy["command_prefixes"]:
+        wpo_notes.append("- `wpo log` takes any message in single quotes, as long as it has no single quote or line break in it.")
+    if "wpo block" in policy["command_prefixes"]:
+        wpo_notes.append("- `wpo block` takes a single-quoted reason with no single quote or line break in it.")
+    if "wpo try-it" in policy["command_prefixes"]:
+        wpo_notes.append("- `wpo try-it` accepts `--file <repo-relative-path>` (write multiline fenced instructions to a scratch file with your file tool, then remove it if untracked) or a single-quoted line.")
+    extra_notes = ("\n" + "\n".join(wpo_notes)) if wpo_notes else ""
     return f"""## Your sandbox (agy)
 A hook checks every tool call against this session's policy and refuses the rest with
 "tool call denied by pre-tool hook: <reason>".
@@ -321,7 +333,7 @@ A hook checks every tool call against this session's policy and refuses the rest
   _ - . / \\ : = , + @ * are accepted: no shell operators, redirection, substitutions, variables or line breaks. No
   {'; '.join(f"{tool} {' '.join(flags)}" for tool, flags in policy['denied_arguments'].items())}; and no absolute or '..'
   paths outside the readable directories.
-  Commands run in the repository.{chr(10) + "- `wpo log` takes any message in single quotes, as long as it has no single quote or line break in it." if "wpo log" in policy["command_prefixes"] else ""}
+  Commands run in the repository.{extra_notes}
 - Writes (with your file tools): {writes}; never .git or .agents.
 - Reads: {reads}.
 - Not available: web search, URLs, the browser, MCP tools and subagents.
