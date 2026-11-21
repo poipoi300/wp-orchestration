@@ -108,8 +108,19 @@ def run_t3_recover(context: Context, body: dict) -> str:
     return f"Woke coordinators for {count} outstanding requests. No held lanes or replacement tasks were started."
 
 
+def run_github_sync(context: Context, body: dict) -> str:
+    return user_actions.github_sync(context)
+
+
 # Action name -> what runs it. Each calls into user_actions, which calls the code `wpo` uses.
-ACTIONS = {"unblock": run_unblock, "approve": run_approve, "deny": run_deny, "message": run_message, "t3-recover": run_t3_recover}
+ACTIONS = {
+    "unblock": run_unblock,
+    "approve": run_approve,
+    "deny": run_deny,
+    "message": run_message,
+    "t3-recover": run_t3_recover,
+    "github-sync": run_github_sync,
+}
 
 
 class Hub:

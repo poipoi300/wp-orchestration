@@ -245,12 +245,26 @@ function receiveSnapshot(snapshot) {
   if (ui.detailId) refreshDetailIfChanged();
 }
 
+function safeHttpUrl(value) {
+  const href = String(value || "").trim();
+  return /^https?:\/\//i.test(href) ? href : "";
+}
+
 function renderBoard(changed) {
   const snapshot = ui.snapshot;
   document.title = `${snapshot.project.name} · wpo`;
   $("project-name").textContent = snapshot.project.name;
   const mode = snapshot.project.routing_mode || "standard";
-  $("tool-name").textContent = mode === "standard" ? "wpo" : `wpo · ${mode} mode`;
+  const gh = snapshot.project.github;
+  const toolEl = $("tool-name");
+  if (snapshot.project.tracker === "github" && gh) {
+    const modeSuffix = mode === "standard" ? "" : ` · ${mode} mode`;
+    const boardHref = safeHttpUrl(gh.project_url);
+    const boardLink = boardHref ? ` · <a href="${esc(boardHref)}" target="_blank" rel="noopener">GitHub board</a>` : (gh.repo ? ` · ${esc(gh.repo)}` : "");
+    toolEl.innerHTML = `wpo${esc(modeSuffix)}${boardLink} · <button type="button" class="link-button" data-action-button="github-sync" data-focus-key="github-sync"${ui.pending.has("github-sync") ? " disabled" : ""}>Sync</button>`;
+  } else {
+    toolEl.textContent = mode === "standard" ? "wpo" : `wpo · ${mode} mode`;
+  }
   renderUsage(snapshot.usage);
   renderNativeBackend(snapshot.native_backend);
   renderAttention(snapshot);
@@ -695,7 +709,12 @@ function wpRow(row, changed) {
   if (row.id === ui.detailId) classes.push("is-selected");
   const progress = row.latest_progress ? progressLine(row.latest_progress) : '<span class="dim">no progress logged yet</span>';
   let waiting = "";
-  if (row.unmerged_deps.length) waiting = `<span class="waiting">after <span class="mono">${esc(row.unmerged_deps.join(", "))}</span></span>`;
+  if (row.pr && row.pr.number && !row.pr.merged) {
+    const prHref = safeHttpUrl(row.pr.url);
+    const prTag = row.pr.auto_merge ? "auto-merge" : (row.pr.draft ? "draft" : "open");
+    const prText = `PR #${row.pr.number} (${prTag})`;
+    waiting = `<span class="waiting">${prHref ? `<a href="${esc(prHref)}" target="_blank" rel="noopener">${esc(prText)}</a>` : esc(prText)}</span>`;
+  } else if (row.unmerged_deps.length) waiting = `<span class="waiting">after <span class="mono">${esc(row.unmerged_deps.join(", "))}</span></span>`;
   else if (row.route_wait_until && row.route_wait_until > nowSeconds()) waiting = `<span class="waiting">waits for a route until ${esc(clock(row.route_wait_until))}</span>`;
   else if (row.escalated_to) waiting = `<span class="waiting">escalated to <span class="mono">${esc(row.escalated_to)}</span></span>`;
   const findingsTitle = row.open_findings.map((finding) => `${finding.id}${finding.answered ? " (answered)" : ""} ${finding.location}`).join("\n");
@@ -765,7 +784,13 @@ function renderMilestones(milestones) {
 }
 
 function renderMerged(merged) {
-  $("merged").innerHTML = merged.map((entry) => `<li>${wpButton(entry.id)}<span class="wp-title" title="${esc(entry.title)}">${esc(entry.title)}</span><span class="nowrap">${timeTag(entry.merged_at)} <span class="dim mono">${esc(entry.commit.slice(0, 7))}</span></span></li>`).join("")
+  $("merged").innerHTML = merged.map((entry) => {
+    const prHref = safeHttpUrl(entry.pr_url);
+    const ref = entry.pr_number
+      ? (prHref ? `<a href="${esc(prHref)}" target="_blank" rel="noopener" class="mono">PR #${esc(entry.pr_number)}</a>` : `<span class="dim mono">PR #${esc(entry.pr_number)}</span>`)
+      : `<span class="dim mono">${esc(entry.commit.slice(0, 7))}</span>`;
+    return `<li>${wpButton(entry.id)}<span class="wp-title" title="${esc(entry.title)}">${esc(entry.title)}</span><span class="nowrap">${timeTag(entry.merged_at)} ${ref}</span></li>`;
+  }).join("")
     || '<li class="empty">Nothing merged yet.</li>';
 }
 
@@ -908,6 +933,15 @@ function detailFacts(detail, row) {
     ["Reviewer", `<span class="mono">${esc(fields.reviewer)}</span>`],
     ["Depends on", depText],
   ];
+  if (detail.url && safeHttpUrl(detail.url)) {
+    facts.unshift(["GitHub issue", `<a href="${esc(safeHttpUrl(detail.url))}" target="_blank" rel="noopener">#${esc(detail.issue_number)}</a>${detail.legacy_wp_id ? ` <span class="dim">(from ${esc(detail.legacy_wp_id)})</span>` : ""}`]);
+  }
+  if (detail.pr && detail.pr.number) {
+    const prUrl = safeHttpUrl(detail.pr.url);
+    const prState = detail.pr.merged ? "merged" : (detail.pr.auto_merge ? "auto-merge" : (detail.pr.draft ? "draft" : String(detail.pr.state || "open").toLowerCase()));
+    const prLabel = `#${detail.pr.number} (${prState})`;
+    facts.push(["Pull request", prUrl ? `<a href="${esc(prUrl)}" target="_blank" rel="noopener">${esc(prLabel)}</a>` : esc(prLabel)]);
+  }
   if (fields.mode) facts.push(["Mode", esc(fields.mode)]);
   if (fields.delegate) facts.push(["Delegate", `<span class="mono">${esc(fields.delegate)}</span>`]);
   facts.push(["Worktree", detail.worktree ? `<span class="mono">${esc(detail.worktree)}</span>` : '<span class="dim">none (read from main)</span>']);
@@ -1005,6 +1039,20 @@ function detailLogs(detail) {
 // -------------------------------------------------------------------------------- interaction
 
 document.addEventListener("click", (event) => {
+  const actionButton = event.target.closest("[data-action-button]");
+  if (actionButton) {
+    const name = actionButton.dataset.actionButton;
+    if (!ui.pending.has(name)) {
+      ui.pending.add(name);
+      actionButton.disabled = true;
+      postAction(name, {}).then((outcome) => {
+        ui.pending.delete(name);
+        toast(name === "github-sync" ? "GitHub sync:" : `${name}:`, outcome);
+        refreshState();
+      });
+    }
+    return;
+  }
   if (event.target.closest('a[href="#needs-you"]')) $("needs-disclosure").open = true;
   const opener = event.target.closest("[data-open-wp]");
   if (opener) { openDetail(opener.dataset.openWp); return; }

@@ -354,7 +354,12 @@ class DashboardData:
         return (file_stamp(git_dir / "refs" / "heads" / project.main_branch), file_stamp(git_dir / "packed-refs"))
 
     def main_listing(self) -> list[wpfile.WorkPackage]:
-        """The WP files committed on main, listed again only when main moved."""
+        """The work packages from main (or read-only GitHub cache + local run state)."""
+        if self.context.project.is_github:
+            self._main = self.context.main_wps(read_only=True)
+            self._main_stamp = (file_stamp(self.runs / "github-cache.json"), self.main_ref_stamp())
+            self._main_read_at = time.monotonic()
+            return self._main
         stamp = self.main_ref_stamp()
         if stamp != self._main_stamp or time.monotonic() - self._main_read_at > MAIN_RECHECK_SECONDS:
             self._main = self.context.main_wps()
@@ -366,10 +371,19 @@ class DashboardData:
         stamp = self._main_stamp
         if stamp != self._merges_stamp or time.monotonic() - self._merges_read_at > MERGES_RECHECK_SECONDS:
             entries = merged_wps(self.context.project, None, RECENT_MERGES)
-            self._merges = [{"id": entry.wp_id, "merged_at": entry.merged_at.timestamp(), "commit": entry.commit[:10]} for entry in entries]
+            self._merges = [
+                {
+                    "id": entry.wp_id,
+                    "merged_at": entry.merged_at.timestamp(),
+                    "commit": entry.commit[:10],
+                    **({"pr_number": entry.pr_number, "pr_url": entry.pr_url} if entry.pr_number else {}),
+                    **({"title": entry.title} if entry.title else {}),
+                }
+                for entry in entries
+            ]
             self._merges_stamp = stamp
             self._merges_read_at = time.monotonic()
-        return [{**merge, "title": titles.get(merge["id"], "")} for merge in self._merges]
+        return [{**merge, "title": merge.get("title") or titles.get(merge["id"], "")} for merge in self._merges]
 
     # ----------------------------------------------------------------------------------- routes
 
@@ -458,15 +472,17 @@ class DashboardData:
     # --------------------------------------------------------------------------------------- WPs
 
     def wp_sections(self, wp: wpfile.WorkPackage) -> dict:
-        """The parts of a WP file the table needs, parsed once per change of the file."""
-        def parse(path: Path) -> dict:
-            text = read_text_file(path)
+        """The parts of a WP file (or rendered GitHub task) the table needs."""
+        def parse_text(text: str) -> dict:
             steps = [CHECKBOX.match(line) for line in wpfile.section_lines(text, "Steps")]
             steps = [match for match in steps if match]
             progress = [line[2:] for line in wpfile.section_lines(text, "Progress log") if line.startswith("- ")]
             return {"steps_done": sum(1 for match in steps if match.group(1) in "xX"), "steps_total": len(steps),
                     "latest_progress": progress[-1] if progress else "", "progress_entries": len(progress)}
-        return self.files.get(wp.path, parse, {"steps_done": 0, "steps_total": 0, "latest_progress": "", "progress_entries": 0})
+        if wp.is_github:
+            return parse_text(wp.text())
+        return self.files.get(wp.path, lambda path: parse_text(read_text_file(path)),
+                              {"steps_done": 0, "steps_total": 0, "latest_progress": "", "progress_entries": 0})
 
     def ledger(self, run_dir: Path) -> dict:
         state = self.files.get(run_dir / LEDGER_FILE, read_json_file, None)
@@ -589,6 +605,7 @@ class DashboardData:
             "route_wait_until": route_wait if isinstance(route_wait, float) else None,
             "worktree": self.worktree(wp.id).exists(),
             "held_by": held.get(wp.id),
+            **({"url": wp.url, "issue_number": wp.issue_number, "pr": wp.pr, "legacy_wp_id": wp.legacy_wp_id} if wp.is_github else {}),
         }
 
     # ------------------------------------------------------------------------------------- usage
@@ -682,8 +699,26 @@ class DashboardData:
             counts = milestones.setdefault(wp.milestone, {status: 0 for status in wpfile.STATUSES})
             counts[wp.status] += 1
         titles = {wp.id: wp.title for wp in main}
+        project_meta: dict = {
+            "name": context.project.name,
+            "root": str(context.project.root),
+            "routing_mode": project_mode(self.runs),
+            "tracker": context.project.tracker,
+            "delivery": context.project.delivery_mode,
+            "external_ledger": context.project.is_external_ledger,
+        }
+        if context.project.is_github and context.tracker is not None:
+            gh_cache = context.tracker.load_cache() or {}
+            proj = gh_cache.get("project") or {}
+            project_meta["github"] = {
+                "repo": gh_cache.get("repo") or context.project.github_config.get("repo"),
+                "project_url": proj.get("url"),
+                "project_title": proj.get("title"),
+                "allow_auto_merge": gh_cache.get("allow_auto_merge"),
+                "fetched_at": gh_cache.get("fetched_at"),
+            }
         return {
-            "project": {"name": context.project.name, "root": str(context.project.root), "routing_mode": project_mode(self.runs)},
+            "project": project_meta,
             "lanes": lanes,
             "wps": rows,
             "milestones": [{"name": name, "counts": counts, "total": sum(counts.values())}
@@ -699,16 +734,17 @@ class DashboardData:
 
     def find_wp(self, wp_id: str) -> wpfile.WorkPackage:
         context = self.refresh_context()
+        normalized = context.normalize_id(wp_id)
         for wp in context.effective_wps(self.main_listing()):
-            if wp.id == wp_id:
+            if wp.id == normalized:
                 return wp
         raise DashboardDataError(f"no WP {wp_id} on {context.project.main_branch}")
 
     def wp_detail(self, wp_id: str) -> dict:
-        """The WP's full record: its file's sections, the round ledger, the findings ledger, the
+        """The WP's full record: its sections, the round ledger, the findings ledger, the
         logs of its run directory."""
         wp = self.find_wp(wp_id)
-        text = read_text_file(wp.path) if wp.path.exists() else ""
+        text = wp.text() if wp.is_github else (read_text_file(wp.path) if wp.path.exists() else "")
         run_dir = self.runs / wp.id
         ledger = self.ledger(run_dir)
         progress = []
@@ -726,6 +762,12 @@ class DashboardData:
         return {
             "id": wp.id,
             "title": wp.title,
+            "source": wp.source,
+            "url": wp.url,
+            "issue_number": wp.issue_number,
+            "pr": wp.pr,
+            "legacy_wp_id": wp.legacy_wp_id,
+            "overrides": wp.overrides,
             "fields": {key: value for key, value in wp.fields.items() if key not in ("id", "title")},
             "file": str(wp.path),
             "worktree": str(self.worktree(wp.id)) if self.worktree(wp.id).exists() else None,

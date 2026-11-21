@@ -65,7 +65,7 @@ PLACEMENT_LOG = "placement.log"
 MAX_TEXT_CHARS = 20000
 EXCERPT_CHARS = 160
 EXIT_NO_ROUTE = 4
-WP_ID = re.compile(r"^WP-[\w.-]+$")
+WP_ID = re.compile(r"^(?:WP|GH)-[\w.-]+$")
 PLACEMENT_ID = re.compile(r"^\d{8}-\d{6}-[0-9a-f]{6}$")
 DECISION_BLOCK = re.compile(r"```json[ \t]*\r?\n(.*?)\r?\n[ \t]*```", re.DOTALL)
 DECISION_KINDS = ("existing", "new")
@@ -105,10 +105,11 @@ def checked_text(text: str, what: str) -> str:
     return stripped
 
 
-def checked_wp_id(wp_id: str) -> str:
-    if not WP_ID.match(wp_id):
+def checked_wp_id(wp_id: str, *, is_github: bool = False) -> str:
+    normalized = wpfile.normalize_wp_id(wp_id, is_github=is_github)
+    if not WP_ID.match(normalized):
         raise UnknownTargetError(f"'{wp_id}' is not a WP id")
-    return wp_id
+    return normalized
 
 
 def lane_output(function: Callable[..., object], *arguments: object) -> str:
@@ -119,17 +120,21 @@ def lane_output(function: Callable[..., object], *arguments: object) -> str:
 
 
 def effective_wp(context: Context, wp_id: str) -> tuple[wpfile.WorkPackage, bool]:
-    """The file holding the WP's live state, as `Context.effective_wps` reads it: its worktree's
-    copy when the worktree has one and main does not hold the WP as done, else the main checkout's;
-    and whether it is the worktree's."""
-    checked_wp_id(wp_id)
+    """The work item holding live state: for GitHub projects, the cached issue overlaid with local
+    split state; for wp-files, its worktree copy when present (unless done on main), else main."""
+    normalized = checked_wp_id(wp_id, is_github=context.project.is_github)
+    if context.project.is_github:
+        try:
+            return context.wp_in_tree(normalized, context.project.root), False
+        except wpfile.WorkPackageError as error:
+            raise UnknownTargetError(f"{normalized}: {error}") from None
     try:
-        main_copy = wpfile.find(context.project.wp_dir(), wp_id)
+        main_copy = wpfile.find(context.project.wp_dir(), normalized)
     except wpfile.WorkPackageError as error:
-        raise UnknownTargetError(f"{wp_id}: {error}") from None
+        raise UnknownTargetError(f"{normalized}: {error}") from None
     if main_copy.status == "done":
         return main_copy, False
-    worktree_copy = context.project.wp_dir(context.project.worktree(wp_id)) / main_copy.file_name
+    worktree_copy = context.project.wp_dir(context.project.worktree(normalized)) / main_copy.file_name
     if worktree_copy.exists():
         return wpfile.parse(worktree_copy), True
     return main_copy, False
@@ -153,9 +158,15 @@ def write_note(wp: wpfile.WorkPackage, note: str, status: str | None) -> wpfile.
 
 
 def add_note(context: Context, wp_id: str, note: str, status: str | None, commit_message: str) -> str:
-    """Writes the note and status into the WP's live file: in its worktree (the merge commits it),
-    or in main, edited and committed under the integration mutex. Returns where it went."""
+    """Writes the note and status: for GitHub tasks into the private local ledger (syncing board
+    status one-way); for wp-files into the worktree copy or committed on main."""
     wp, in_worktree = effective_wp(context, wp_id)
+    if wp.is_github:
+        if note:
+            context.add_wp_context_note(wp, note, kind="user")
+        if status is not None and wp.status != status:
+            context.set_wp_status(wp, status)
+        return f"in its private local ledger ({context.project.wp_run_dir(wp.id) / 'state.json'})"
     if in_worktree:
         write_note(wp, note, status)
         return f"in its worktree's WP file ({wp.path})"
@@ -167,6 +178,22 @@ def add_note(context: Context, wp_id: str, note: str, status: str | None, commit
         return [relative]
 
     return f"in main ({edit_and_commit_main(context, commit_message, edit)})"
+
+
+def github_sync(context: Context) -> str:
+    """Forces a GitHub cache sync and reconciles open PRs."""
+    if not context.project.is_github or context.tracker is None:
+        raise UserActionError("this project is not using the GitHub tracker")
+    from .github import GhError, reconcile_open_prs
+    try:
+        result = reconcile_open_prs(context, force_sync=True)
+    except GhError as error:
+        raise UserActionError(str(error)) from error
+    context.journal.emit(
+        "github-synced",
+        f"synced GitHub ({len(result['open'])} open PR(s), {len(result['merged'])} newly merged, {len(result['failed_checks'])} check failure(s))",
+    )
+    return f"Synced GitHub: {len(result['open'])} open PR(s), {len(result['merged'])} newly merged, {len(result['failed_checks'])} failed checks."
 
 
 def restart_lane(context: Context, wp: wpfile.WorkPackage) -> list[str]:
