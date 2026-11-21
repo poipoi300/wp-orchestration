@@ -1424,6 +1424,21 @@ class ReviewHardeningRegressionTests(unittest.TestCase):
             scope_after = json.loads((dest_runs / "t3" / "scope" / "abc.json").read_text(encoding="utf-8"))
             self.assertEqual(scope_after["log_path"], str(dest_runs / "GH-2" / "attempt-1-builder.log"))
 
+            # Verify _remap_run_path resolves symlinked/alias prefixes (mirrors Windows 8.3 short paths & macOS /var).
+            alias_parent = base / "alias-runs"
+            try:
+                alias_parent.symlink_to(old_runs)
+            except OSError:
+                alias_parent = None
+            if alias_parent is not None:
+                remapped = migrate._remap_run_path(
+                    str(alias_parent / "WP-0002" / "attempt-1-builder.log"),
+                    old_runs,
+                    dest_runs,
+                    {"WP-0002": "GH-2"},
+                )
+                self.assertEqual(remapped, str(dest_runs / "GH-2" / "attempt-1-builder.log"))
+
             # Post-migration local updates to GH-2 MUST survive an idempotent re-run (with paginated GraphQL)!
             run_state.set_status(dest_runs / "GH-2", "review")
             run_state.append_progress(dest_runs / "GH-2", "Post-migration work completed", "builder")

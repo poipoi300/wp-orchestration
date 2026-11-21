@@ -50,7 +50,7 @@ def sanitize_for_github(text: str, project_root: Path | None = None) -> str:
     cleaned = text
     if project_root is not None:
         resolved = project_root.resolve()
-        variants = {str(resolved), resolved.as_posix()}
+        variants = {str(resolved), resolved.as_posix(), str(project_root), project_root.as_posix()}
         for root_text in sorted(variants, key=len, reverse=True):
             if not root_text:
                 continue

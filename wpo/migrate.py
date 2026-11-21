@@ -289,22 +289,44 @@ def _existing_legacy_issues(gh: github.GhClient, repo: str) -> dict[str, tuple[i
 
 def _remap_run_path(value: str, old_runs: Path, dest_runs: Path, wp_to_gh: dict[str, str]) -> str:
     """Rewrites paths under `old_runs/<WP-XXXX>/...` or `old_runs/t3/...` to their migrated
-    locations under `dest_runs/<GH-N>/...` or `dest_runs/t3/...`."""
+    locations under `dest_runs/<GH-N>/...` or `dest_runs/t3/...`.
+
+    Resolves both paths first so Windows 8.3 short paths (`RUNNER~1` vs `runneradmin`), drive
+    casing differences, and macOS `/var` -> `/private/var` symlinks all match reliably.
+    """
     if not value:
         return value
-    old_variants = sorted({str(old_runs.resolve()), old_runs.resolve().as_posix(), str(old_runs), old_runs.as_posix()}, key=len, reverse=True)
-    for prefix in old_variants:
-        if not prefix:
-            continue
-        for sep in ("/", "\\"):
-            base = prefix.rstrip("/\\") + sep
-            if value.startswith(base):
-                rel = value[len(base):].replace("\\", "/")
-                parts = rel.split("/", 1)
-                head = wp_to_gh.get(parts[0], parts[0])
-                tail = f"/{parts[1]}" if len(parts) > 1 else ""
-                return str(dest_runs / head) + (tail.replace("/", os.sep) if tail else "")
-    return value
+    rel_parts: tuple[str, ...] | None = None
+    try:
+        resolved_old = old_runs.resolve()
+        resolved_val = Path(value).resolve()
+        rel_parts = resolved_val.relative_to(resolved_old).parts
+    except (OSError, ValueError):
+        rel_parts = None
+
+    if rel_parts is None:
+        old_variants = sorted(
+            {str(old_runs.resolve()), old_runs.resolve().as_posix(), str(old_runs), old_runs.as_posix()},
+            key=len,
+            reverse=True,
+        )
+        for prefix in old_variants:
+            if not prefix:
+                continue
+            for sep in ("/", "\\"):
+                base = prefix.rstrip("/\\") + sep
+                matched = value.lower().startswith(base.lower()) if os.name == "nt" else value.startswith(base)
+                if matched:
+                    rel = value[len(base):].replace("\\", "/").strip("/")
+                    rel_parts = tuple(p for p in rel.split("/") if p)
+                    break
+            if rel_parts is not None:
+                break
+
+    if not rel_parts:
+        return value
+    head = wp_to_gh.get(rel_parts[0], rel_parts[0])
+    return str(dest_runs.joinpath(head, *rel_parts[1:]))
 
 
 def _write_json_atomic(path: Path, data: dict) -> None:
