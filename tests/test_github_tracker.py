@@ -3832,6 +3832,16 @@ class Round3HardeningTests(unittest.TestCase):
             self.assertEqual(privacy.check_public_text("See /srv/home/alice/public"), [])
             self.assertEqual(privacy.check_public_text("See https://example.com/home/alice"), [])
 
+            # A60 + Windows 8.3 short-path sanitization/detection: short path aliases are stripped & checked.
+            with mock.patch("wpo.privacy._windows_short_path", return_value=r"C:\Users\RUNNER~1\AppData\Local\Temp\repo"):
+                self.assertEqual(
+                    privacy.sanitize_for_github(r"C:\Users\RUNNER~1\AppData\Local\Temp\repo/M1", base),
+                    "M1",
+                )
+                self.assertTrue(
+                    privacy.check_code_diff_text(r"leak=C:\Users\RUNNER~1\AppData\Local\Temp\repo\secret", project_root=base)
+                )
+
             # A62: `ledger_writer` succeeds when machine `project_defaults` set `runs_dir` or `tracker`!
             repo_62, _, machine_62 = make_repo_with_remote(base / "a62", {"name": "a62"})
             p_defaults = Project.locate(

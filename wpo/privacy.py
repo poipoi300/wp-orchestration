@@ -8,6 +8,7 @@ for secret patterns, personal home paths and raw ledger markers so private state
 from __future__ import annotations
 
 import json
+import os
 import re
 from collections.abc import Iterable
 from pathlib import Path
@@ -129,17 +130,51 @@ class PrivacyError(ValueError):
         super().__init__(f"blocked outbound GitHub text for privacy safety: {summary}")
 
 
+def _windows_short_path(path: Path) -> str | None:
+    """Returns the Windows 8.3 short-path alias for `path` when available (e.g. `RUNNER~1`)."""
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        raw = str(path)
+        buf_size = max(260, len(raw) + 16)
+        while True:
+            buf = ctypes.create_unicode_buffer(buf_size)
+            needed = ctypes.windll.kernel32.GetShortPathNameW(raw, buf, buf_size)
+            if needed == 0:
+                return None
+            if needed < buf_size:
+                return buf.value
+            buf_size = needed + 1
+    except (AttributeError, OSError):
+        return None
+
+
+def _path_text_variants(path: Path) -> list[str]:
+    """All string representations of `path` (raw, resolved, POSIX, and Windows 8.3 short path)."""
+    variants: set[str] = set()
+    for candidate in (path, path.resolve()):
+        for text in (str(candidate), candidate.as_posix()):
+            cleaned = text.rstrip("/\\")
+            if cleaned:
+                variants.add(cleaned)
+        if short := _windows_short_path(candidate):
+            for text in (short, short.replace("\\", "/")):
+                cleaned = text.rstrip("/\\")
+                if cleaned:
+                    variants.add(cleaned)
+    return sorted(variants, key=len, reverse=True)
+
+
 def sanitize_for_github(text: str, project_root: Path | None = None) -> str:
-    """Rewrites repository-root paths to repo-relative paths while leaving secrets untouched so
-    `check_public_text` catches and refuses them rather than silently masking credentials."""
+    """Rewrites repository-root paths (including Windows 8.3 short aliases) to repo-relative paths
+    while leaving secrets untouched so `check_public_text` catches and refuses them."""
     cleaned = text
     if project_root is not None:
-        resolved = project_root.resolve()
-        variants = {str(resolved), resolved.as_posix(), str(project_root), project_root.as_posix()}
-        for root_text in sorted(variants, key=len, reverse=True):
-            if not root_text:
-                continue
-            cleaned = cleaned.replace(root_text + "/", "").replace(root_text + "\\", "").replace(root_text, ".")
+        flags = re.IGNORECASE if os.name == "nt" else 0
+        for root_text in _path_text_variants(project_root):
+            cleaned = re.sub(re.escape(root_text) + r"[/\\]", "", cleaned, flags=flags)
+            cleaned = re.sub(re.escape(root_text), ".", cleaned, flags=flags)
     return cleaned
 
 
@@ -174,13 +209,7 @@ def check_public_text(text: str, project_root: Path | None = None, *, allow_loca
 def _machine_path_variants(path: Path | None) -> list[str]:
     if path is None:
         return []
-    variants: set[str] = set()
-    for candidate in (path, path.resolve()):
-        for text in (str(candidate), candidate.as_posix()):
-            cleaned = text.rstrip("/\\")
-            if len(cleaned) >= 4:
-                variants.add(cleaned)
-    return sorted(variants, key=len, reverse=True)
+    return [variant for variant in _path_text_variants(path) if len(variant) >= 4]
 
 
 def check_code_diff_text(
