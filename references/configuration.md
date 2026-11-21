@@ -411,9 +411,10 @@ Key split-state and GitHub settings (see [github.md](github.md) for the full con
   omitted from existing configs).
 - `delivery`: `"auto"` (`"local-ff"` for `wp-files`, `"pr-automerge"` for `github`), `"local-ff"`,
   `"pr"`, `"pr-draft"`, or `"pr-automerge"`.
-- `runs_dir`: repo-relative path (default `.orchestration/runs`), explicit path, or `"external"`
-  to place all private transcripts, logs, findings and run state outside the Git checkout under
-  `machine.data_dir`.
+- `runs_dir`: `null` (default: auto-selects `"external"` for `tracker: "github"` and
+  `".orchestration/runs"` for `tracker: "wp-files"`), an explicit repo-relative or absolute path,
+  or `"external"` to place all private transcripts, logs, findings and run state outside the Git
+  checkout under `machine.data_dir`.
 - `require_owns`, `default_builder`, `default_reviewer`, `default_lane`: defaults for GitHub issues
   that omit explicit `## Scope` paths or routing tiers (personal routing stays local via
   `wpo ledger override`).
