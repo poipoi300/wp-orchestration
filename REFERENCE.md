@@ -20,8 +20,11 @@ The task prompt starts with the files the role needs, inlined so no turn is spen
 `builder_reading` / `reviewer_reading` from the main checkout (`path` or `path#heading` for one `##`
 section), then the WP file from the tree. Sessions record progress with `wpo log "<message>" [--step N]`
 (it writes the dated, keyed Progress log line and ticks the step; `WPO_ROLE` and `WPO_ROUTE` are in the
-session's environment) and check their work with `wpo verify` (fixers, the WP's Verify commands and the
-owns check, printing only failures). OpenCode sessions read AGENTS.md themselves and get the rest atop
+session's environment), record Try it instructions with `wpo try-it`, mark blockers with `wpo block`,
+and check their work with `wpo verify` (fixers, the WP's Verify commands and the
+owns check, printing only failures). For GitHub-backed projects (`tracker: "github"`, see
+[references/github.md](references/github.md)), all mutable run state and transcripts live in the
+private local ledger (`runs_dir: "external"` keeps them outside the checkout). OpenCode sessions read AGENTS.md themselves and get the rest atop
 the prompt (`<log>.prompt.md` records the exact stdin).
 Reviewers start from a **review brief** (`review_brief.py`, saved as `attempt-N-review-brief.md`): the
 diff since the branch left main, untracked files included, and each symbol the diff adds, removes or

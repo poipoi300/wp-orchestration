@@ -168,10 +168,11 @@ The full defaults and accessors are in [wpo/machine.py](../wpo/machine.py).
   debounce, callback interval and optional coordinator-idle timeout. Repository attachment lives
   in its ignored run state. See [t3-bridge.md](t3-bridge.md) for attachment, callbacks and recovery.
   `t3.native_instructions` says which native sessions load instruction files themselves, below.
-- `python`, `claude`, `agy`, `opencode`, `shim_dir`: executable and installation locations.
+- `python`, `claude`, `agy`, `opencode`, `gh`, `shim_dir`: executable and installation locations.
   Commands resolve on PATH; paths may use `~`. `python` defaults to the running interpreter.
-- `state_dir`, `usage`: local router state and an optional external usage-budget adapter, cache,
-  and history. The adapter is not bundled and Claude hooks do not run under T3 automatically.
+- `state_dir`, `data_dir`, `usage`: local router state, out-of-repo private ledger root
+  (`~/.local/share/wp-orchestration`, used when a project sets `runs_dir: "external"`), and an
+  optional external usage-budget adapter, cache, and history. The adapter is not bundled and Claude hooks do not run under T3 automatically.
   Without verified subscription usage, the legacy router may withhold those routes.
 - `skills.dirs` / `skills.paths`: skill discovery roots and explicit `SKILL.md` mappings.
   Portable defaults search `.agents`, `.codex`, then `.claude` under the home directory.
@@ -397,11 +398,28 @@ supervisors to adopt changes when the user intends to do so.
 
 ## Project settings
 
-`.orchestration/config.json` contains WP locations, verification commands, owned/shared paths,
-lanes, integration hooks, and repository rules. Start with
+`.orchestration/config.json` contains tracker/delivery policy, WP locations, verification commands,
+owned/shared paths, lanes, integration hooks, and repository rules. Start with
 [templates/config.example.json](../templates/config.example.json). Defaults are documented in
 [wpo/project.py](../wpo/project.py). Use relative paths and keep local tool paths, account policy,
 and private environment notes in machine configuration.
+
+Key split-state and GitHub settings (see [github.md](github.md) for the full contract):
+
+- `tracker`: `"wp-files"` (committed `WP-*.md` files) or `"github"` (GitHub Issues + Projects v2 +
+  private local ledger).
+- `delivery`: `"auto"` (`"local-ff"` for `wp-files`, `"pr-automerge"` for `github`), `"local-ff"`,
+  `"pr"`, `"pr-draft"`, or `"pr-automerge"`.
+- `runs_dir`: repo-relative path (default `.orchestration/runs`), explicit path, or `"external"`
+  to place all private transcripts, logs, findings and run state outside the Git checkout under
+  `machine.data_dir`.
+- `require_owns`, `default_builder`, `default_reviewer`, `default_lane`: defaults for GitHub issues
+  that omit explicit `## Scope` paths or routing tiers (personal routing stays local via
+  `wpo ledger override`).
+- `github`: `repo`, `remote`, `project_number`, `project_owner`, `status_field`, `status_map`,
+  `lane_field`, `lane_label_prefix`, `blocked_label`, `issue_labels`, `cache_ttl_seconds`,
+  `poll_seconds`, `merge_method`, `delete_branch_on_merge`, `auto_merge_fallback`,
+  `privacy_check`, `sync_board_status`, and `transcript_retention_days`.
 
 Precedence is built-in defaults → machine `project_defaults` → project JSON. Routing additionally
 starts with `models/tiers.json`, then machine `routing`, then the resulting project's `routing`.

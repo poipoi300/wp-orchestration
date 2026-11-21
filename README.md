@@ -42,13 +42,15 @@ CLI or connect MCP servers.
 From your project's main Git checkout:
 
 ```sh
-wpo init --name my-project
+wpo init --name my-project            # legacy committed WP-*.md tracker
+wpo init --name my-project --github   # GitHub Issues + Projects v2 + auto-merge PRs + external private ledger
 ```
 
-Edit `.orchestration/config.json` for the WP directory, lanes, verification
-commands, owned/shared paths, and integration policy. Create WPs using
-[the template](templates/WP-TEMPLATE.md), then commit the project configuration,
-WP files, and `.gitignore` before scheduling work.
+Edit `.orchestration/config.json` for the tracker, lanes, verification commands, owned/shared
+paths, and integration/PR policy. For GitHub-backed projects or deterministic migration from
+existing WP files (`wpo migrate github`), see [the GitHub & split-ledger guide](references/github.md).
+For legacy WP files, create WPs using [the template](templates/WP-TEMPLATE.md), then commit the
+project configuration, WP files, and `.gitignore` before scheduling work.
 
 Machine settings belong outside the repository. Copy
 [machine.example.json](templates/machine.example.json), configure only the

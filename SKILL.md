@@ -18,6 +18,10 @@ Choose the execution environment before starting work:
   requests the existing WPO supervisors, lanes, or subprocess harnesses. Those processes are
   separate from T3 threads. Select `execution_mode: standalone` explicitly. Preserve existing holds
   and pauses unless the user asks to resume.
+- **GitHub Issues, Projects v2 & split private ledger:** read [references/github.md](references/github.md)
+  to track work in GitHub Issues/Projects with auto-merge PRs (`Fixes #N`) while keeping transcripts,
+  findings, attempts, and usage telemetry in an out-of-repo private ledger, or to run deterministic
+  migration with `wpo migrate github`.
 - **Configuring or sharing the skill:** read [references/configuration.md](references/configuration.md).
   Machine paths, custom skills, model preferences, quota policy, and integrations belong in
   untracked machine configuration. Project rules belong in `.orchestration/config.json`.
