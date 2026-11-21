@@ -17,14 +17,15 @@ to accidentally commit transcripts or package them into a release.
 ## Start a new GitHub-backed project
 
 ```sh
-wpo init --name my-project --github --project-number 1
+wpo init --name my-project --project-number 1
 wpo github sync
 wpo github status
 wpo status
 ```
 
-`wpo init --github` sets `"tracker": "github"`, `"delivery": "pr-automerge"`, and
-`"runs_dir": "external"`, and detects `github.repo` from `origin`.
+`wpo init` defaults to `"tracker": "github"`, `"delivery": "pr-automerge"`, and
+`"runs_dir": "external"`, and detects `github.repo` from `origin` (pass `--wp-files` for
+the legacy committed `WP-*.md` tracker or `--keep-repo-ledger` to keep runs in `.orchestration/runs/`).
 
 ## Deterministic migration from WP markdown files
 

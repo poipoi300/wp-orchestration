@@ -42,8 +42,8 @@ CLI or connect MCP servers.
 From your project's main Git checkout:
 
 ```sh
-wpo init --name my-project            # legacy committed WP-*.md tracker
-wpo init --name my-project --github   # GitHub Issues + Projects v2 + auto-merge PRs + external private ledger
+wpo init --name my-project              # GitHub Issues + Projects v2 + auto-merge PRs + external private ledger (default)
+wpo init --name my-project --wp-files   # legacy committed WP-*.md tracker
 ```
 
 Edit `.orchestration/config.json` for the tracker, lanes, verification commands, owned/shared

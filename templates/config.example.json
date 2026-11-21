@@ -1,10 +1,10 @@
 {
   "$comment": "wp-orchestration project settings (SKILL.md, Project configuration). Every key is optional and overrides its default on its own; objects such as autofix merge per entry. 'name' defaults to the checkout's folder name.",
   "name": "MyProject",
-  "tracker": "wp-files",
-  "delivery": "auto",
+  "tracker": "github",
+  "delivery": "pr-automerge",
   "wp_dir": "docs/plan/wp",
-  "runs_dir": ".orchestration/runs",
+  "runs_dir": "external",
   "github": {
     "repo": null,
     "project_number": null,

@@ -302,13 +302,21 @@ def build_parser() -> argparse.ArgumentParser:
     ledger_override.add_argument("--clear", action="append", default=[], help="override key(s) to clear")
 
     commands.add_parser("install-shim", help="put the `wpo` command on PATH")
-    init = commands.add_parser("init", help="add .orchestration/ to a repository")
+    init = commands.add_parser("init", help="add .orchestration/ to a repository (GitHub + external private ledger by default)")
     init.add_argument("--name", required=True)
-    init.add_argument("--github", action="store_true", help="configure GitHub Issues + auto-merge PR delivery + external private ledger")
-    init.add_argument("--repo", help="GitHub repository (owner/name) for --github")
-    init.add_argument("--project-number", type=int, help="GitHub Project v2 number for --github")
-    init.add_argument("--project-owner", help="GitHub Project owner login or @me for --github")
-    init.add_argument("--external-ledger", action="store_true", help="store private transcripts/runs outside the git repository")
+    init_tracker = init.add_mutually_exclusive_group()
+    init_tracker.add_argument("--github", action="store_true", dest="use_github", default=True,
+                              help="configure GitHub Issues + auto-merge PR delivery + external private ledger (default)")
+    init_tracker.add_argument("--wp-files", action="store_false", dest="use_github",
+                              help="use legacy committed WP-*.md files instead of GitHub Issues")
+    init.add_argument("--repo", help="GitHub repository (owner/name); defaults to git remote origin")
+    init.add_argument("--project-number", type=int, help="GitHub Project v2 number")
+    init.add_argument("--project-owner", help="GitHub Project owner login or @me")
+    init_ledger = init.add_mutually_exclusive_group()
+    init_ledger.add_argument("--external-ledger", action="store_true", dest="external_ledger", default=None,
+                             help="store private transcripts/runs outside the git repository (default for GitHub)")
+    init_ledger.add_argument("--keep-repo-ledger", action="store_false", dest="external_ledger",
+                             help="store runs under .orchestration/runs/ inside the checkout (default for --wp-files)")
     return parser
 
 
@@ -329,8 +337,9 @@ def install_shim() -> int:
     return 0
 
 
-def init_project(start: Path, name: str, *, use_github: bool = False, repo: str | None = None,
-                 project_number: int | None = None, project_owner: str | None = None, external_ledger: bool = False) -> int:
+def init_project(start: Path, name: str, *, use_github: bool = True, repo: str | None = None,
+                 project_number: int | None = None, project_owner: str | None = None,
+                 external_ledger: bool | None = None) -> int:
     from .project import CONFIG_RELATIVE_PATH, git, main_checkout_of
     root = main_checkout_of(start.resolve())
     config_path = root / CONFIG_RELATIVE_PATH
@@ -340,6 +349,8 @@ def init_project(start: Path, name: str, *, use_github: bool = False, repo: str 
     config_path.parent.mkdir(parents=True, exist_ok=True)
     template = json.loads((SKILL_ROOT / "templates" / "config.example.json").read_text(encoding="utf-8"))
     template["name"] = name
+    use_external = use_github if external_ledger is None else external_ledger
+    template["runs_dir"] = "external" if use_external else ".orchestration/runs"
     if use_github:
         from .github import parse_github_repo
         detected_repo = repo
@@ -349,7 +360,6 @@ def init_project(start: Path, name: str, *, use_github: bool = False, repo: str 
                 detected_repo = parse_github_repo(remote_res.stdout)
         template["tracker"] = "github"
         template["delivery"] = "pr-automerge"
-        template["runs_dir"] = "external"
         gh_cfg = dict(template.get("github") or {})
         gh_cfg["repo"] = detected_repo
         if project_number is not None:
@@ -357,8 +367,9 @@ def init_project(start: Path, name: str, *, use_github: bool = False, repo: str 
         if project_owner is not None:
             gh_cfg["project_owner"] = project_owner
         template["github"] = gh_cfg
-    elif external_ledger:
-        template["runs_dir"] = "external"
+    else:
+        template["tracker"] = "wp-files"
+        template["delivery"] = "auto"
     config_path.write_text(json.dumps(template, indent=2) + "\n", encoding="utf-8")
     gitignore = root / ".gitignore"
     existing = gitignore.read_text(encoding="utf-8") if gitignore.exists() else ""
@@ -447,7 +458,7 @@ def main(argv: list[str] | None = None) -> int:
         return init_project(
             arguments.project or Path.cwd(),
             arguments.name,
-            use_github=arguments.github,
+            use_github=arguments.use_github,
             repo=arguments.repo,
             project_number=arguments.project_number,
             project_owner=arguments.project_owner,

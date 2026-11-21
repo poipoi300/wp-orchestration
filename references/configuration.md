@@ -406,8 +406,9 @@ and private environment notes in machine configuration.
 
 Key split-state and GitHub settings (see [github.md](github.md) for the full contract):
 
-- `tracker`: `"wp-files"` (committed `WP-*.md` files) or `"github"` (GitHub Issues + Projects v2 +
-  private local ledger).
+- `tracker`: `"github"` (default for `wpo init`: GitHub Issues + Projects v2 + private local
+  ledger) or `"wp-files"` (legacy committed `WP-*.md` files; remains the runtime default when
+  omitted from existing configs).
 - `delivery`: `"auto"` (`"local-ff"` for `wp-files`, `"pr-automerge"` for `github`), `"local-ff"`,
   `"pr"`, `"pr-draft"`, or `"pr-automerge"`.
 - `runs_dir`: repo-relative path (default `.orchestration/runs`), explicit path, or `"external"`

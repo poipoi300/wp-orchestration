@@ -904,7 +904,7 @@ class CliGithubAndLedgerTests(unittest.TestCase):
 
             buf = io.StringIO()
             with redirect_stdout(buf):
-                rc = cli.init_project(repo, "proj", use_github=True, project_number=12, external_ledger=True)
+                rc = cli.main(["--project", str(repo), "init", "--name", "proj", "--project-number", "12"])
             self.assertEqual(rc, 0)
             cfg = json.loads((repo / ".orchestration" / "config.json").read_text(encoding="utf-8"))
             self.assertEqual(cfg["tracker"], "github")
@@ -912,6 +912,26 @@ class CliGithubAndLedgerTests(unittest.TestCase):
             self.assertEqual(cfg["runs_dir"], "external")
             self.assertEqual(cfg["github"]["repo"], "octo/proj")
             self.assertEqual(cfg["github"]["project_number"], 12)
+
+            # Verify --wp-files opt-in and ledger location flags.
+            legacy_repo = base / "legacy-proj"
+            legacy_repo.mkdir()
+            git(legacy_repo, "init", "-q", "-b", "main")
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(cli.main(["--project", str(legacy_repo), "init", "--name", "legacy-proj", "--wp-files"]), 0)
+            legacy_cfg = json.loads((legacy_repo / ".orchestration" / "config.json").read_text(encoding="utf-8"))
+            self.assertEqual(legacy_cfg["tracker"], "wp-files")
+            self.assertEqual(legacy_cfg["delivery"], "auto")
+            self.assertEqual(legacy_cfg["runs_dir"], ".orchestration/runs")
+
+            inrepo_gh = base / "inrepo-gh"
+            inrepo_gh.mkdir()
+            git(inrepo_gh, "init", "-q", "-b", "main")
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(cli.main(["--project", str(inrepo_gh), "init", "--name", "inrepo-gh", "--keep-repo-ledger"]), 0)
+            inrepo_cfg = json.loads((inrepo_gh / ".orchestration" / "config.json").read_text(encoding="utf-8"))
+            self.assertEqual(inrepo_cfg["tracker"], "github")
+            self.assertEqual(inrepo_cfg["runs_dir"], ".orchestration/runs")
 
             machine_path = base / "machine.json"
             machine_path.write_text(json.dumps({

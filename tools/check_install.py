@@ -32,7 +32,7 @@ def main() -> None:
     with tempfile.TemporaryDirectory(prefix="wpo-installed-") as temporary:
         root = Path(temporary)
         machine = root / "machine.json"
-        machine.write_text(json.dumps({"dashboard": {"autostart": False}}), encoding="utf-8")
+        machine.write_text(json.dumps({"dashboard": {"autostart": False}, "data_dir": str(root / "data")}), encoding="utf-8")
         environment = {**os.environ, "WPO_MACHINE_CONFIG": str(machine)}
         run("git", "init", "-q", "-b", "main", cwd=root, environment=environment)
         for command in ([sys.executable, "-I", "-m", "wpo"], [sys.executable, "-I", "-B", str(wpo.ENTRY_POINT)]):
@@ -42,8 +42,8 @@ def main() -> None:
                 raise RuntimeError("Installed CLI omitted continuous operation")
         run(sys.executable, "-I", "-m", "wpo", "init", "--name", "installed-check", cwd=root, environment=environment)
         config = json.loads((root / ".orchestration/config.json").read_text(encoding="utf-8"))
-        if config["name"] != "installed-check":
-            raise RuntimeError("Installed project template was not applied")
+        if config["name"] != "installed-check" or config["tracker"] != "github" or config["delivery"] != "pr-automerge" or config["runs_dir"] != "external":
+            raise RuntimeError("Installed project template did not apply GitHub default")
         state = json.loads(run(sys.executable, "-I", "-m", "wpo", "continuous", "status", cwd=root, environment=environment))
         if state["policy"]["enabled"] or state["scheduler"]["state"] != "not_started":
             raise RuntimeError("Installed continuous operation must remain opt-in")
