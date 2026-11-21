@@ -147,7 +147,7 @@ class Supervisor:
         sole_blockers -= {wp_id for wp_id in sole_blockers if self.waiting_for_route(wp_id)}
         eligible = [wp for wp in effective if wp.status in POOL_STATUSES and wp.id not in sole_blockers and wp.lane not in holds
                     and wp.id not in self.handed_back and set(wp.depends_on) <= merged and not self.escalation(wp.id)
-                    and not any(sub not in merged for sub in getattr(wp, "sub_issues", ()))]
+                    and not any(sub not in merged for sub in (wp.open_sub_issues if wp.is_github else getattr(wp, "sub_issues", ())))]
         live = {lane for lane in {wp.lane for wp in eligible if wp.lane} if supervisor_pid(self.context, lane)}
         return sorted(eligible, key=lambda wp: (wp.id in depended_on, wp.lane in live, wp.milestone, wp.id))
 
@@ -181,7 +181,8 @@ class Supervisor:
         for wp in candidates:
             if not self.selected(wp) or self.finished.get(wp.id) == wp.status or wp.status not in RESUMABLE_STATUSES:
                 continue
-            if any(sub not in merged for sub in getattr(wp, "sub_issues", ())):
+            blocking_children = wp.open_sub_issues if wp.is_github else getattr(wp, "sub_issues", ())
+            if any(sub not in merged for sub in blocking_children):
                 continue
             if not set(wp.depends_on) <= merged:
                 continue
@@ -276,6 +277,9 @@ class Supervisor:
         worktree.parent.mkdir(parents=True, exist_ok=True)
         arguments = ["worktree", "add", "--quiet", str(worktree), branch] if exists else ["worktree", "add", "--quiet", "-b", branch, str(worktree), self.project.main_branch]
         git(self.project.root, *arguments)
+        if self.project.is_github:
+            from . import run_state
+            run_state.set_workspace_binding(self.project.wp_run_dir(wp_id), worktree, branch, owner="standalone")
         setup = self.project.config["worktree_setup"]
         if setup:
             failures = run_commands(self.project.config["shell"], setup, worktree, session_env(self.context, wp_id, worktree),
@@ -475,26 +479,58 @@ class Supervisor:
         recorded = wp.pr.get("head_sha") or self.open_pr_heads.get(wp.id)
         return bool(head and recorded and head == recorded)
 
+    def _pr_closed_unmerged(self, wp: wpfile.WorkPackage) -> bool:
+        """Whether `wp`'s tracked PR was closed without merging (requires a fresh delivery decision)."""
+        return bool(wp.pr and wp.pr.get("state") == "CLOSED" and not wp.pr.get("merged"))
+
     def _awaiting_automerge_prs(self, effective: list[wpfile.WorkPackage], merged: set[str]) -> list[wpfile.WorkPackage]:
-        """Open PRs with auto-merge armed (or direct-merge fallback) that belong to this lane or
-        block a selected WP in this lane, and have not failed CI checks."""
+        """Open PRs with auto-merge armed (or WPO-delivered direct-merge fallback), plus remotely
+        merged PRs whose local `main` fast-forward/reconciliation is still pending."""
         if not self.project.is_github:
             return []
+        from . import run_state
+        from .github import GhError, is_wpo_delivered_pr, resolve_repo
         direct_fallback = self.project.delivery_mode == "pr-automerge" and str(self.project.github_config.get("auto_merge_fallback") or "wait") == "direct-merge"
+        repo = ""
+        if direct_fallback:
+            try:
+                repo = self.context.tracker.repo() if self.context.tracker is not None else resolve_repo(self.project)
+            except GhError:
+                repo = str(self.project.github_config.get("repo") or "")
         by_id = {wp.id: wp for wp in effective}
         watched_ids = {wp.id for wp in effective if self.selected(wp)}
         for wp in effective:
             if self.selected(wp) and wp.status in RESUMABLE_STATUSES:
                 watched_ids.update(dep for dep in wp.depends_on if dep not in merged)
+                watched_ids.update(sub for sub in wp.open_sub_issues if sub not in merged)
         waiting: list[wpfile.WorkPackage] = []
         for wp_id in sorted(watched_ids):
             wp = by_id.get(wp_id)
-            if wp is None or wp.is_merged or not wp.pr or wp.pr.get("state") != "OPEN":
+            if wp is None or not wp.pr:
+                continue
+            # Remotely merged PR not yet synced into local main: keep polling until local fast-forward succeeds.
+            if wp.is_merged:
+                if wp.id not in merged:
+                    waiting.append(wp)
+                continue
+            if wp.pr.get("state") != "OPEN":
                 continue
             if wp.pr.get("check_state") in ("FAILURE", "ERROR") or wp.pr.get("merge_state_status") == "DIRTY":
                 continue
-            if wp.pr.get("auto_merge") or direct_fallback:
+            if wp.pr.get("auto_merge"):
                 waiting.append(wp)
+            else:
+                local_state = run_state.load(self.project.runs_dir / wp.id)
+                local_pr = local_state.get("pr") if isinstance(local_state.get("pr"), dict) else {}
+                head_sha = wp.pr.get("head_sha")
+                if head_sha and local_pr.get("merge_queue_removed_head_sha") == head_sha:
+                    # A63: Removed from merge queue on this head — do not poll forever.
+                    continue
+                if local_pr.get("merge_queued") and local_pr.get("merge_queued_head_sha") == head_sha:
+                    waiting.append(wp)
+                elif direct_fallback and repo and is_wpo_delivered_pr(local_state, wp.pr, repo=repo, main_branch=self.project.main_branch):
+                    # A45: Wait on direct-merge fallback ONLY for PRs passing the exact WPO delivery provenance check.
+                    waiting.append(wp)
         return waiting
 
     def loop(self) -> None:
@@ -510,9 +546,11 @@ class Supervisor:
             merged = self.context.merged_done_ids(main_copies)
             effective = self.context.effective_wps(main_copies)
             for wp in effective:
-                if (wp.status == "done" and wp.id not in merged and not block_reason(self.context, wp.id)
+                if (wp.status == "done" and not wp.is_merged and wp.id not in merged
+                        and not block_reason(self.context, wp.id)
                         and self.selected(wp) and wp.id not in self.integration_failed
                         and not self._pr_already_current(wp)
+                        and not self._pr_closed_unmerged(wp)
                         and self.project.worktree(wp.id).exists() and self.settled_for_integration(wp)):
                     self.integrate(wp.id)
             picked = self.next_wp()
@@ -578,13 +616,15 @@ class Supervisor:
         return True
 
     def run(self) -> None:
+        from . import run_state
         # One supervisor per lane machine-wide, held for the supervisor's lifetime.
         lane_mutex = NamedMutex(self.project.mutex_name("lane", self.name))
         if not lane_mutex.acquire(blocking=False):
             print(f"a supervisor for {self.name} is already running")
             return
         try:
-            self.supervise()
+            with run_state.ledger_writer(self.project, "supervisor", self.name):
+                self.supervise()
         finally:
             lane_mutex.release()
 

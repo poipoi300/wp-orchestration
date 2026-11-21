@@ -9,11 +9,11 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-from . import run_state, wpfile
+from . import privacy, run_state, wpfile
 from .boot import ensure_boot
 from .events import Journal
 from .machine import MachineConfig
-from .project import TASKS_RELATIVE_PATH, Project, git
+from .project import Project, git
 from .routing import Router
 
 UNCHECKED_STEP_RE = re.compile(r"^(\s*[-*] )\[ \]")
@@ -41,7 +41,7 @@ class Context:
         if getattr(project, "is_github", False):
             from .github import GhClient, GitHubTracker
             client = gh_client or GhClient(str(machine.raw.get("gh", "gh")), cwd=project.root)
-            tracker = GitHubTracker(project, client)
+            tracker = GitHubTracker(project, client, extra_forbidden=privacy.private_route_identifiers(machine, project, router))
         context = cls(project, machine, router, journal, tracker=tracker)
         if machine.execution_mode == "t3":
             from .t3 import Bridge
@@ -49,7 +49,10 @@ class Context:
         return context
 
     def normalize_id(self, wp_id: str) -> str:
-        return wpfile.normalize_wp_id(wp_id, is_github=self.project.is_github)
+        normalized = wpfile.normalize_wp_id(wp_id, is_github=self.project.is_github)
+        if self.project.is_github and normalized.startswith("WP-") and hasattr(self.project, "resolve_legacy_wp_id"):
+            return self.project.resolve_legacy_wp_id(normalized)
+        return normalized
 
     # ------------------------------------------------------------------------------ work packages
 
@@ -127,10 +130,32 @@ class Context:
         return wpfile.find(self.project.wp_dir(tree), normalized)
 
     def merged_done_ids(self, main_copies: list[wpfile.WorkPackage] | None = None) -> set[str]:
-        """Work items completed and merged into the default branch (unblocking dependents)."""
+        """Work items completed with trusted local verification that their merge landed on `main`."""
         if self.project.is_github:
+            from .github import main_contains_merge
             items = self.main_wps(read_only=True) if main_copies is None else main_copies
-            return {wp.id for wp in items if wp.is_merged}
+            merged: set[str] = set()
+            for wp in items:
+                if not wp.is_merged:
+                    continue
+                local_state = run_state.load(self.project.runs_dir / wp.id)
+                local_pr = local_state.get("pr") if isinstance(local_state.get("pr"), dict) else {}
+                if local_state.get("local_ff_merged"):
+                    if main_contains_merge(self.project, local_state.get("local_ff_commit")):
+                        merged.add(wp.id)
+                    continue
+                if wp.pr and wp.pr.get("merged"):
+                    merge_commit = wp.pr.get("merge_commit") or local_pr.get("merge_commit")
+                    if merge_commit:
+                        if main_contains_merge(self.project, str(merge_commit)) and local_pr.get("local_synced") is not False:
+                            merged.add(wp.id)
+                    elif local_pr.get("local_synced") is True:
+                        merged.add(wp.id)
+                    continue
+                # Require a trusted local migration completion record (never a remote issue comment alone).
+                if local_state.get("migrated_merged_on_main"):
+                    merged.add(wp.id)
+            return merged
         return {wp.id for wp in (self.main_wps() if main_copies is None else main_copies) if wp.status == "done"}
 
     # ------------------------------------------------------------------ backend-aware mutations
@@ -243,14 +268,13 @@ class Context:
         """Returns the inlined task specification for a session prompt.
 
         For `wp-files`, inlines the WP markdown file from `tree`. For `github`, renders the
-        GitHub issue overlaid with private local run state and writes a gitignored copy under
-        `<tree>/.orchestration/tasks/<id>/issue.md`.
+        GitHub issue overlaid with private local run state and stores its snapshot inside the
+        private per-issue ledger (`<runs>/<id>/issue.md`), never inside the git worktree.
         """
         from .session_brief import included_files
         if not wp.is_github:
             return included_files(tree, [f"{self.project.wp_dir_relative}/{wp.file_name}"])
-        snapshot_path = tree / TASKS_RELATIVE_PATH / wp.id / "issue.md"
-        snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+        snapshot_path = self.project.wp_run_dir(wp.id) / "issue.md"
         text = wp.text()
         snapshot_path.write_text(text, encoding="utf-8")
         meta_lines = [

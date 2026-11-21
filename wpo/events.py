@@ -58,6 +58,8 @@ ATTENTION_KINDS = frozenset({
     "delegate-worker-stalled",
     # CI checks failed or merge conflicts appeared on a PR opened by WPO.
     "pr-checks-failed",
+    # A tracked PR was closed on GitHub without merging.
+    "pr-closed-unmerged",
     # GitHub auto-merge could not be enabled on an opened PR (repo setting or branch rules).
     "pr-automerge-unavailable",
     # Refreshing GitHub issue/PR/board state failed.
@@ -70,6 +72,7 @@ INFO_KINDS = frozenset({
     "boot-changed",
     "wp-done",
     "wp-merged",
+    "cleanup-skipped",
     "pr-opened",
     "pr-automerge-enabled",
     "github-synced",

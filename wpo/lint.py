@@ -287,7 +287,11 @@ def lint_wp(wp: wpfile.WorkPackage, wps: dict[str, wpfile.WorkPackage], root: Pa
             add("error", CHECK_SECTIONS, f"no '## {heading}' section, or it is empty")
 
     commands = wp.verify_commands()
-    if not commands:
+    if wp.is_github and wp.untrusted_verify_commands:
+        add("warning", CHECK_VERIFY,
+            f"issue defines {len(wp.untrusted_verify_commands)} unapproved Verify command(s) that will not execute until locally authorized "
+            f"(review the issue, then run `wpo ledger approve-verify {wp.id}` or set `wpo ledger override {wp.id} --verify ...`)")
+    elif not commands:
         if wp.is_github and settings.round_checks:
             add("warning", CHECK_VERIFY, "the Verify block has no task-specific commands: only project round checks will run; add a '## Verify' block if scoped tests are needed")
         elif settings.round_checks:
@@ -303,7 +307,13 @@ def lint_wp(wp: wpfile.WorkPackage, wps: dict[str, wpfile.WorkPackage], root: Pa
     if not any(NUMBERED_CRITERION.match(line) for line in wp.section("Acceptance criteria")):
         add("error", CHECK_CRITERIA, "the acceptance criteria are not numbered (1., 2., ...), so reviews cannot cite them")
 
+    external_by_id = {entry["id"]: entry for entry in getattr(wp, "external_blockers", ()) if isinstance(entry, dict) and entry.get("id")}
     for dependency in wp.depends_on:
+        if dependency in external_by_id:
+            state = external_by_id[dependency].get("state", "OPEN")
+            if state != "CLOSED":
+                add("warning", CHECK_DEPENDENCIES, f"depends on external cross-repository blocker {dependency} ({state}): work remains blocked until it closes")
+            continue
         if dependency not in wps:
             missing_kind = "does not exist" if wp.is_github else "has no WP file"
             add("error", CHECK_DEPENDENCIES, f"depends on {dependency}, which {missing_kind}")

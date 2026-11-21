@@ -14,8 +14,10 @@ dashboard and scheduler never hammer the API. All outbound GitHub text passes th
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
+import shlex
 import subprocess
 import tempfile
 import time
@@ -25,7 +27,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from . import privacy, run_state, wpfile
-from .platform import FileLock, replace_file
+from .platform import FileLock, NamedMutex, replace_file
 from .project import Project, git
 
 CACHE_FILE = "github-cache.json"
@@ -59,9 +61,15 @@ query($owner: String!, $name: String!, $cursor: String) {
         closedAt
         milestone { title number }
         labels(first: 50) { nodes { name } }
-        parent { number }
-        subIssues(first: 50) { nodes { number state } }
-        blockedBy(first: 50) { nodes { number state } }
+        parent { number repository { nameWithOwner } }
+        subIssues(first: 50) {
+          pageInfo { hasNextPage endCursor }
+          nodes { number state repository { nameWithOwner } }
+        }
+        blockedBy(first: 50) {
+          pageInfo { hasNextPage endCursor }
+          nodes { number state repository { nameWithOwner } }
+        }
         closedByPullRequestsReferences(first: 10, includeClosedPrs: true) {
           pageInfo { hasNextPage endCursor }
           nodes {
@@ -73,10 +81,15 @@ query($owner: String!, $name: String!, $cursor: String) {
             mergeCommit { oid }
             headRefName
             headRefOid
+            baseRefName
+            baseRefOid
+            isCrossRepository
             isDraft
+            isInMergeQueue
             mergeStateStatus
             autoMergeRequest { enabledAt mergeMethod }
             statusCheckRollup { state }
+            commits { totalCount }
           }
         }
         projectItems(first: 20) {
@@ -120,11 +133,42 @@ query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
           mergeCommit { oid }
           headRefName
           headRefOid
+          baseRefName
+          baseRefOid
+          isCrossRepository
           isDraft
+          isInMergeQueue
           mergeStateStatus
           autoMergeRequest { enabledAt mergeMethod }
           statusCheckRollup { state }
+          commits { totalCount }
         }
+      }
+    }
+  }
+}
+"""
+
+ISSUE_SUBISSUES_GRAPHQL = """
+query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
+  repository(owner: $owner, name: $name) {
+    issue(number: $number) {
+      subIssues(first: 50, after: $cursor) {
+        pageInfo { hasNextPage endCursor }
+        nodes { number state repository { nameWithOwner } }
+      }
+    }
+  }
+}
+"""
+
+ISSUE_BLOCKED_BY_GRAPHQL = """
+query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
+  repository(owner: $owner, name: $name) {
+    issue(number: $number) {
+      blockedBy(first: 50, after: $cursor) {
+        pageInfo { hasNextPage endCursor }
+        nodes { number state repository { nameWithOwner } }
       }
     }
   }
@@ -134,7 +178,7 @@ query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
 OPEN_PRS_GRAPHQL = """
 query($owner: String!, $name: String!, $cursor: String) {
   repository(owner: $owner, name: $name) {
-    pullRequests(first: 100, after: $cursor, states: [OPEN, MERGED], orderBy: {field: UPDATED_AT, direction: DESC}) {
+    pullRequests(first: 100, after: $cursor, states: [OPEN, MERGED, CLOSED], orderBy: {field: UPDATED_AT, direction: DESC}) {
       pageInfo { hasNextPage endCursor }
       nodes {
         number
@@ -148,11 +192,25 @@ query($owner: String!, $name: String!, $cursor: String) {
         headRefName
         headRefOid
         baseRefName
+        baseRefOid
+        isCrossRepository
         isDraft
+        isInMergeQueue
         mergeStateStatus
         autoMergeRequest { enabledAt mergeMethod }
         statusCheckRollup { state }
+        commits { totalCount }
       }
+    }
+  }
+}
+"""
+
+PR_MERGE_QUEUE_GRAPHQL = """
+query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      isInMergeQueue
     }
   }
 }
@@ -453,6 +511,31 @@ def parse_issue_body(body: str) -> dict:
     }
 
 
+def issue_body_sha256(body: str) -> str:
+    """Stable SHA-256 digest of a GitHub issue body (CRLF-normalized), used to bind local Verify
+    command authorization and unfinished migration body checkpoints across platforms."""
+    normalized = (body or "").replace("\r\n", "\n").replace("\r", "\n")
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def extract_issue_verify_commands(parsed: dict) -> list[str]:
+    """Extracts executable Verify commands declared in a parsed GitHub issue body or its hidden metadata."""
+    commands: list[str] = []
+    in_fence = False
+    for line in (parsed.get("sections") or {}).get("Verify") or ():
+        if line.startswith("```"):
+            in_fence = not in_fence
+        elif in_fence and line.strip() and not line.strip().startswith("#"):
+            cmd = line.strip()
+            if cmd not in commands:
+                commands.append(cmd)
+    for extra in parsed.get("verify_extra") or ():
+        cmd = str(extra).strip()
+        if cmd and cmd not in commands:
+            commands.append(cmd)
+    return commands
+
+
 def render_task_markdown(issue: dict, parsed: dict, local_state: dict) -> str:
     """Renders the unified read-only markdown view of a GitHub issue overlaid with private local
     run state (`steps_done`, `context_notes`, `progress`, `reevaluations`, `reviews`, `try_it`, `handoff`)."""
@@ -519,7 +602,8 @@ def render_task_markdown(issue: dict, parsed: dict, local_state: dict) -> str:
 
 
 def rewrite_wp_references(text: str, id_map: dict[str, int] | None) -> str:
-    """Deterministically rewrites `WP-XXXX` mentions to `#<N>` when mapped."""
+    """Deterministically rewrites `WP-XXXX` mentions to `#<N>` when mapped, preserving
+    `<!-- wpo ... -->` metadata comments verbatim so `legacy_wp_id` markers stay intact."""
     if not id_map or not text:
         return text
 
@@ -529,12 +613,20 @@ def rewrite_wp_references(text: str, id_map: dict[str, int] | None) -> str:
             return f"#{id_map[wp_id]}"
         return wp_id
 
-    return WP_REF_RE.sub(_replace, text)
+    parts: list[str] = []
+    last = 0
+    for meta_match in WPO_META_COMMENT.finditer(text):
+        parts.append(WP_REF_RE.sub(_replace, text[last:meta_match.start()]))
+        parts.append(meta_match.group(0))
+        last = meta_match.end()
+    parts.append(WP_REF_RE.sub(_replace, text[last:]))
+    return "".join(parts)
 
 
 def render_issue_body(wp: wpfile.WorkPackage, *, id_map: dict[str, int] | None = None,
                       project_root: Path | None = None, privacy_check: bool = True,
-                      allow_local_paths: bool = False, migrated_merged: bool = False) -> str:
+                      allow_local_paths: bool = False, migrated_merged: bool = False,
+                      extra_forbidden: Iterable[str] = ()) -> str:
     """Renders a clean, public-safe GitHub issue body from a WP file.
 
     Excludes private/mutable runtime sections (Progress log, Review, Re-evaluation, Handoff, Try it)
@@ -573,7 +665,9 @@ def render_issue_body(wp: wpfile.WorkPackage, *, id_map: dict[str, int] | None =
         blocks.append(f"<!-- wpo {json.dumps(meta, sort_keys=True)} -->")
 
     rendered = "\n\n".join(blocks).strip() + "\n"
-    return privacy.require_public_safe(rendered, project_root, enabled=privacy_check, allow_local_paths=allow_local_paths)
+    return privacy.require_public_safe(
+        rendered, project_root, enabled=privacy_check, allow_local_paths=allow_local_paths, extra_forbidden=extra_forbidden,
+    )
 
 
 def _public_verify_command(command: str, project_root: Path | None) -> str:
@@ -596,7 +690,7 @@ def _public_verify_command(command: str, project_root: Path | None) -> str:
 
 def render_pr_body(wp: wpfile.WorkPackage, *, summary: str = "", verify_commands: Iterable[str] = (),
                    project_root: Path | None = None, privacy_check: bool = True,
-                   allow_local_paths: bool = False) -> str:
+                   allow_local_paths: bool = False, extra_forbidden: Iterable[str] = ()) -> str:
     """Renders a clean, sanitized Pull Request description with `Fixes #N` and `## Try it`."""
     blocks: list[str] = []
     if wp.issue_number is not None:
@@ -619,19 +713,47 @@ def render_pr_body(wp: wpfile.WorkPackage, *, summary: str = "", verify_commands
     pr_meta = {"task_id": wp.id, **({"issue": wp.issue_number} if wp.issue_number is not None else {})}
     blocks.append(f"<!-- wpo-pr {json.dumps(pr_meta, sort_keys=True)} -->")
     rendered = "\n\n".join(blocks).strip() + "\n"
-    return privacy.require_public_safe(rendered, project_root, enabled=privacy_check, allow_local_paths=allow_local_paths)
+    return privacy.require_public_safe(
+        rendered, project_root, enabled=privacy_check, allow_local_paths=allow_local_paths, extra_forbidden=extra_forbidden,
+    )
 
 
 # --------------------------------------------------------------------------- GitHub tracker
 
 
-def _status_from_project(issue: dict, project_number: int | None, status_field: str, lane_field: str) -> tuple[str | None, str | None, str | None]:
-    """Returns (project_item_id, status_name, lane_name) for the configured project."""
+def _project_owner_from_url(url: str) -> str | None:
+    match = re.search(r"/(?:users|orgs)/([^/]+)/projects/\d+", url or "")
+    return match.group(1).lower() if match else None
+
+
+def _status_from_project(
+    issue: dict,
+    project_number: int | None,
+    status_field: str,
+    lane_field: str,
+    *,
+    project_id: str | None = None,
+    project_owner: str | None = None,
+) -> tuple[str | None, str | None, str | None]:
+    """Returns (project_item_id, status_name, lane_name) strictly for the configured owner's project."""
+    if project_number is None:
+        return None, None, None
+    owner_filter = None
+    if project_owner and project_owner != "@me":
+        owner_filter = str(project_owner).strip().lower()
     items = (issue.get("projectItems") or {}).get("nodes") or []
     for item in items:
         proj = item.get("project") or {}
-        if project_number is not None and proj.get("number") != project_number:
-            continue
+        if project_id:
+            if proj.get("id") != project_id:
+                continue
+        else:
+            if proj.get("number") != project_number:
+                continue
+            if owner_filter:
+                item_owner = _project_owner_from_url(str(proj.get("url") or ""))
+                if not item_owner or item_owner != owner_filter:
+                    continue
         status_name = None
         lane_name = None
         for value in (item.get("fieldValues") or {}).get("nodes") or []:
@@ -644,27 +766,59 @@ def _status_from_project(issue: dict, project_number: int | None, status_field: 
     return None, None, None
 
 
-def _reverse_status_map(status_map: dict[str, str]) -> dict[str, str]:
-    reverse: dict[str, str] = {}
-    # Prefer canonical primary WPO status when multiple map to the same board column.
-    for wpo_status in ("todo", "in_progress", "review", "blocked", "done", "changes_requested"):
-        label = status_map.get(wpo_status)
-        if label and label.lower() not in reverse:
-            reverse[label.lower()] = wpo_status
-    return reverse
+def _pr_matches_repo_and_base(candidate: dict, main_branch: str) -> bool:
+    if candidate.get("isCrossRepository") or candidate.get("is_cross_repository"):
+        return False
+    base = candidate.get("baseRefName") or candidate.get("base")
+    return not base or str(base) == main_branch
 
 
-def _pick_pr_for_issue(issue: dict, prs_by_branch: dict[str, dict], branch_name: str, local_pr: dict | None) -> dict | None:
-    linked = (issue.get("closedByPullRequestsReferences") or {}).get("nodes") or []
-    # Prefer merged PR, then open PR, then matching branch PR, then local state.
+def _pick_pr_for_issue(
+    issue: dict,
+    prs_by_branch: dict[str, dict],
+    prs_by_number: dict[int, dict],
+    branch_name: str,
+    local_pr: dict | None,
+    *,
+    main_branch: str = "main",
+    pr_delivery: dict | None = None,
+) -> dict | None:
+    linked_all = [node for node in (issue.get("closedByPullRequestsReferences") or {}).get("nodes") or [] if isinstance(node, dict)]
+    linked = [node for node in linked_all if _pr_matches_repo_and_base(node, main_branch)]
+    tracked_num: int | None = None
+    if isinstance(pr_delivery, dict) and pr_delivery.get("number") is not None:
+        tracked_num = int(pr_delivery["number"])
+    elif isinstance(local_pr, dict) and local_pr.get("number") is not None:
+        tracked_num = int(local_pr["number"])
+
+    # 1. Prefer same-repo merged PR targeting main_branch (preferring tracked PR number if present).
+    for candidate in linked:
+        if (candidate.get("merged") or candidate.get("state") == "MERGED") and candidate.get("number") == tracked_num:
+            return _normalize_pr(candidate)
     for candidate in linked:
         if candidate.get("merged") or candidate.get("state") == "MERGED":
             return _normalize_pr(candidate)
+
+    # 2. Reconcile tracked PR's live state FIRST (OPEN, MERGED, or CLOSED) so an unrelated open PR
+    # can neither shadow WPO's open PR nor hide a tracked PR's terminal CLOSED-unmerged state.
+    if tracked_num is not None:
+        for candidate in linked_all:
+            if candidate.get("number") == tracked_num:
+                return _normalize_pr(candidate)
+        if tracked_num in prs_by_number:
+            return _normalize_pr(prs_by_number[tracked_num])
+
+    # 3. Any same-repo OPEN PR targeting main_branch linked to the issue.
     for candidate in linked:
         if candidate.get("state") == "OPEN":
             return _normalize_pr(candidate)
-    if branch_name in prs_by_branch:
+
+    # 4. Same-repo branch match targeting main_branch, then closed linked PR, then local fallback.
+    if branch_name in prs_by_branch and _pr_matches_repo_and_base(prs_by_branch[branch_name], main_branch):
         return _normalize_pr(prs_by_branch[branch_name])
+    for candidate in reversed(linked):
+        if candidate.get("state") == "CLOSED":
+            return _normalize_pr(candidate)
     if local_pr:
         return dict(local_pr)
     return None
@@ -730,6 +884,21 @@ def _normalize_pr(raw: dict) -> dict:
     rollup = raw.get("statusCheckRollup")
     check_state = _rollup_check_state(rollup) if rollup is not None else raw.get("check_state")
     auto_req = raw.get("autoMergeRequest")
+    merge_method = None
+    if isinstance(auto_req, dict) and auto_req.get("mergeMethod"):
+        merge_method = str(auto_req["mergeMethod"]).lower()
+    elif raw.get("merge_method"):
+        merge_method = str(raw["merge_method"]).lower()
+    commits_raw = raw.get("commits")
+    commits_count: int | None = raw.get("commits_count")
+    commit_headlines: list[str] | None = raw.get("commit_headlines")
+    if isinstance(commits_raw, dict) and isinstance(commits_raw.get("totalCount"), int):
+        commits_count = int(commits_raw["totalCount"])
+    elif isinstance(commits_raw, list):
+        commits_count = len(commits_raw)
+        headlines = [str(c.get("messageHeadline") or "").strip() for c in commits_raw if isinstance(c, dict)]
+        if headlines and all(headlines):
+            commit_headlines = headlines
     return {
         "number": raw.get("number"),
         "url": raw.get("url"),
@@ -739,9 +908,16 @@ def _normalize_pr(raw: dict) -> dict:
         "merge_commit": commit_oid,
         "branch": raw.get("headRefName") or raw.get("branch"),
         "head_sha": raw.get("headRefOid") or raw.get("head_sha"),
+        "base": raw.get("baseRefName") or raw.get("base"),
+        "base_sha": raw.get("baseRefOid") or raw.get("base_sha"),
+        "is_cross_repository": bool(raw.get("isCrossRepository") if "isCrossRepository" in raw else raw.get("is_cross_repository")),
         "draft": bool(raw.get("isDraft") if "isDraft" in raw else raw.get("draft")),
+        "in_merge_queue": raw.get("isInMergeQueue") if "isInMergeQueue" in raw else raw.get("in_merge_queue"),
         "merge_state_status": raw.get("mergeStateStatus") or raw.get("merge_state_status"),
         "auto_merge": bool(auto_req) if "autoMergeRequest" in raw else bool(raw.get("auto_merge")),
+        "merge_method": merge_method,
+        "commits_count": commits_count,
+        "commit_headlines": commit_headlines,
         "check_state": check_state,
     }
 
@@ -749,11 +925,12 @@ def _normalize_pr(raw: dict) -> dict:
 class GitHubTracker:
     """GitHub Issues + Projects v2 + PR tracker backed by a local read-through cache."""
 
-    def __init__(self, project: Project, gh: GhClient) -> None:
+    def __init__(self, project: Project, gh: GhClient, *, extra_forbidden: Iterable[str] = ()) -> None:
         self.project = project
         self.gh = gh
         self.config = project.github_config
         self.cache_path = project.runs_dir / CACHE_FILE
+        self.extra_forbidden = tuple(extra_forbidden)
 
     def repo(self) -> str:
         return resolve_repo(self.project)
@@ -807,30 +984,31 @@ class GitHubTracker:
             }
         return None
 
-    def _finish_issue_pr_pages(self, owner: str, name: str, issue_node: dict) -> None:
-        """Pages remaining `closedByPullRequestsReferences` entries when an issue has >10 linked PRs."""
-        refs = issue_node.get("closedByPullRequestsReferences")
-        if not isinstance(refs, dict) or issue_node.get("number") is None:
+    def _finish_issue_connection_pages(self, owner: str, name: str, issue_node: dict, field_name: str, query: str) -> None:
+        """Pages remaining GraphQL connection nodes on an issue when `pageInfo.hasNextPage` is true."""
+        conn = issue_node.get(field_name)
+        if not isinstance(conn, dict) or issue_node.get("number") is None:
             return
-        page_info = refs.get("pageInfo") or {}
+        page_info = conn.get("pageInfo") or {}
         if not page_info.get("hasNextPage") or not page_info.get("endCursor"):
             return
-        nodes = list(refs.get("nodes") or [])
-        pr_cursor = page_info["endCursor"]
+        nodes = list(conn.get("nodes") or [])
+        cursor = page_info["endCursor"]
         number = int(issue_node["number"])
-        while pr_cursor:
-            data = self.gh.graphql(
-                ISSUE_CLOSED_BY_PRS_GRAPHQL,
-                {"owner": owner, "name": name, "number": number, "cursor": pr_cursor},
-            )
-            conn = ((data.get("repository") or {}).get("issue") or {}).get("closedByPullRequestsReferences") or {}
-            nodes.extend(node for node in conn.get("nodes") or [] if isinstance(node, dict))
-            next_info = conn.get("pageInfo") or {}
+        while cursor:
+            data = self.gh.graphql(query, {"owner": owner, "name": name, "number": number, "cursor": cursor})
+            page_conn = ((data.get("repository") or {}).get("issue") or {}).get(field_name) or {}
+            nodes.extend(node for node in page_conn.get("nodes") or [] if isinstance(node, dict))
+            next_info = page_conn.get("pageInfo") or {}
             if not next_info.get("hasNextPage") or not next_info.get("endCursor"):
                 break
-            pr_cursor = next_info["endCursor"]
-        refs["nodes"] = nodes
-        refs["pageInfo"] = {"hasNextPage": False, "endCursor": None}
+            cursor = next_info["endCursor"]
+        conn["nodes"] = nodes
+        conn["pageInfo"] = {"hasNextPage": False, "endCursor": None}
+
+    def _finish_issue_pr_pages(self, owner: str, name: str, issue_node: dict) -> None:
+        """Pages remaining `closedByPullRequestsReferences` entries when an issue has >10 linked PRs."""
+        self._finish_issue_connection_pages(owner, name, issue_node, "closedByPullRequestsReferences", ISSUE_CLOSED_BY_PRS_GRAPHQL)
 
     def sync(self, *, force: bool = False) -> dict:
         """Refreshes `<runs>/github-cache.json` from GitHub when missing, stale, or forced."""
@@ -858,6 +1036,8 @@ class GitHubTracker:
             page_issues = [node for node in conn.get("nodes") or [] if isinstance(node, dict)]
             for issue_node in page_issues:
                 self._finish_issue_pr_pages(owner, name, issue_node)
+                self._finish_issue_connection_pages(owner, name, issue_node, "subIssues", ISSUE_SUBISSUES_GRAPHQL)
+                self._finish_issue_connection_pages(owner, name, issue_node, "blockedBy", ISSUE_BLOCKED_BY_GRAPHQL)
             issues.extend(page_issues)
             page_info = conn.get("pageInfo") or {}
             if not page_info.get("hasNextPage") or not page_info.get("endCursor"):
@@ -893,34 +1073,62 @@ class GitHubTracker:
         }
         return self.save_cache(snapshot)
 
-    def _issue_to_wp(self, issue: dict, prs_by_branch: dict[str, dict]) -> wpfile.WorkPackage:
+    def _issue_to_wp(
+        self,
+        issue: dict,
+        prs_by_branch: dict[str, dict],
+        prs_by_number: dict[int, dict],
+        *,
+        current_repo: str,
+        project_id: str | None = None,
+        project_owner: str | None = None,
+        issues_by_number: dict[int, dict] | None = None,
+    ) -> wpfile.WorkPackage:
         number = int(issue["number"])
         wp_id = f"GH-{number}"
         run_dir = self.project.runs_dir / wp_id
         local_state = run_state.load(run_dir)
         overrides = local_state.get("overrides") or {}
-        parsed = parse_issue_body(issue.get("body") or "")
+        raw_body = str(issue.get("body") or "")
+        parsed = parse_issue_body(raw_body)
 
         labels = tuple(node["name"] for node in (issue.get("labels") or {}).get("nodes") or [] if isinstance(node, dict) and node.get("name"))
         project_number = self.config.get("project_number")
-        _item_id, board_status, board_lane = _status_from_project(
+        _item_id, _board_status, board_lane = _status_from_project(
             issue,
             int(project_number) if project_number is not None else None,
             str(self.config.get("status_field") or "Status"),
             str(self.config.get("lane_field") or "Lane"),
+            project_id=project_id,
+            project_owner=project_owner,
         )
 
         branch_name = self.project.branch(wp_id)
-        pr = _pick_pr_for_issue(issue, prs_by_branch, branch_name, local_state.get("pr"))
+        pr = _pick_pr_for_issue(
+            issue, prs_by_branch, prs_by_number, branch_name, local_state.get("pr"),
+            main_branch=self.project.main_branch,
+            pr_delivery=local_state.get("pr_delivery"),
+        )
         github_state = str(issue.get("state") or "OPEN").upper()
         has_merged_pr = bool(pr and pr.get("merged"))
-        migrated_merged = bool(local_state.get("migrated_merged_on_main") or parsed["meta"].get("migrated_merged"))
-        is_merged = has_merged_pr or (github_state == "CLOSED" and migrated_merged)
+        local_ff_merged = bool(local_state.get("local_ff_merged")) and main_contains_merge(self.project, local_state.get("local_ff_commit"))
+        # Require trusted local migration completion record (never trust remote public comment alone).
+        migrated_merged = bool(local_state.get("migrated_merged_on_main"))
+        is_merged = has_merged_pr or local_ff_merged or (github_state == "CLOSED" and migrated_merged)
 
-        # Status reconciliation: merged PR or migrated-merged always yields done; an issue closed
-        # without a merged PR (e.g. NOT_PLANNED) is NOT merged (never unblocks dependents) and
-        # presents as blocked so supervisors never build it. Otherwise local inner-loop state wins.
+        # Status reconciliation: merged PR, verified local-ff merge, or trusted migrated-merged always yields
+        # done; an issue closed without verified merge evidence is NOT merged and presents as blocked.
+        # Project v2 board columns are strictly one-way (WPO -> GitHub) and never imported as status.
         blocked_label = self.config.get("blocked_label")
+        if is_merged:
+            public_status = "done"
+        elif github_state == "CLOSED" or (blocked_label and blocked_label in labels):
+            public_status = "blocked"
+        elif pr and pr.get("state") == "OPEN":
+            public_status = "review"
+        else:
+            public_status = "todo"
+
         if is_merged:
             status = "done"
         elif github_state == "CLOSED":
@@ -929,16 +1137,14 @@ class GitHubTracker:
             status = str(local_state["status"])
         elif blocked_label and blocked_label in labels:
             status = "blocked"
-        elif board_status:
-            reverse_map = _reverse_status_map(self.config.get("status_map") or {})
-            status = reverse_map.get(board_status.lower(), "todo")
         else:
             status = "todo"
 
         # Lane resolution: local override > Project Lane field > lane:<name> label > issue meta > default_lane.
         lane_prefix = str(self.config.get("lane_label_prefix") or "lane:")
         label_lane = next((label[len(lane_prefix):] for label in labels if lane_prefix and label.startswith(lane_prefix)), "")
-        lane = str(overrides.get("lane") or board_lane or label_lane or parsed["lane"] or self.project.config.get("default_lane") or "").strip()
+        public_lane = str(board_lane or label_lane or parsed["lane"] or self.project.config.get("default_lane") or "").strip()
+        lane = str(overrides.get("lane") or public_lane).strip()
 
         # Ownership resolution: local override > issue Scope/Owns/meta.
         if isinstance(overrides.get("owns"), list):
@@ -948,27 +1154,95 @@ class GitHubTracker:
             owns = list(parsed["owns"])
             owns_explicit = bool(parsed["owns_explicit"] or self.project.require_owns)
 
-        # Native blockedBy relationships + optional meta fallback.
+        # Native blockedBy relationships (repo-qualified for cross-repo blockers) + optional meta fallback.
         deps: list[str] = []
+        external_blockers: list[dict] = []
+        current_repo_lower = current_repo.lower()
         for blocker in (issue.get("blockedBy") or {}).get("nodes") or []:
-            if isinstance(blocker, dict) and blocker.get("number") is not None:
-                dep_id = f"GH-{int(blocker['number'])}"
+            if not isinstance(blocker, dict) or blocker.get("number") is None:
+                continue
+            blocker_repo = str(((blocker.get("repository") or {}).get("nameWithOwner")) or current_repo).strip()
+            blocker_num = int(blocker["number"])
+            blocker_state = str(blocker.get("state") or "OPEN").upper()
+            if blocker_repo.lower() == current_repo_lower or not current_repo_lower:
+                dep_id = f"GH-{blocker_num}"
                 if dep_id != wp_id and dep_id not in deps:
                     deps.append(dep_id)
+            else:
+                ext_id = f"{blocker_repo}#{blocker_num}"
+                external_blockers.append({"id": ext_id, "repo": blocker_repo, "number": blocker_num, "state": blocker_state})
+                if blocker_state != "CLOSED" and ext_id not in deps:
+                    deps.append(ext_id)
         for dep_id in parsed["blocked_by_meta"]:
             if dep_id != wp_id and dep_id not in deps:
                 deps.append(dep_id)
 
         parent_node = issue.get("parent")
-        parent_id = f"GH-{int(parent_node['number'])}" if isinstance(parent_node, dict) and parent_node.get("number") is not None else None
-        sub_issues = tuple(
-            f"GH-{int(node['number'])}"
-            for node in (issue.get("subIssues") or {}).get("nodes") or []
-            if isinstance(node, dict) and node.get("number") is not None
-        )
+        parent_id: str | None = None
+        if isinstance(parent_node, dict) and parent_node.get("number") is not None:
+            parent_repo = str(((parent_node.get("repository") or {}).get("nameWithOwner")) or current_repo).strip()
+            parent_id = (
+                f"GH-{int(parent_node['number'])}"
+                if (parent_repo.lower() == current_repo_lower or not current_repo_lower)
+                else f"{parent_repo}#{int(parent_node['number'])}"
+            )
+
+        sub_issues_list: list[str] = []
+        open_sub_issues_list: list[str] = []
+        for node in (issue.get("subIssues") or {}).get("nodes") or []:
+            if not isinstance(node, dict) or node.get("number") is None:
+                continue
+            child_repo = str(((node.get("repository") or {}).get("nameWithOwner")) or current_repo).strip()
+            child_num = int(node["number"])
+            same_repo = (child_repo.lower() == current_repo_lower) or not current_repo_lower
+            child_id = f"GH-{child_num}" if same_repo else f"{child_repo}#{child_num}"
+            if child_id not in sub_issues_list:
+                sub_issues_list.append(child_id)
+            child_state = str(node.get("state") or "OPEN").upper()
+            child_pending_sync = False
+            if same_repo and child_state == "CLOSED":
+                child_local_state = run_state.load(self.project.runs_dir / child_id)
+                child_local_pr = child_local_state.get("pr") if isinstance(child_local_state.get("pr"), dict) else {}
+                child_issue_node = (issues_by_number or {}).get(child_num)
+                child_live_pr = (
+                    _pick_pr_for_issue(
+                        child_issue_node,
+                        prs_by_branch,
+                        prs_by_number,
+                        self.project.branch(child_id),
+                        child_local_pr or None,
+                        main_branch=self.project.main_branch,
+                        pr_delivery=child_local_state.get("pr_delivery"),
+                    )
+                    if child_issue_node is not None
+                    else (child_local_pr or None)
+                )
+                if child_live_pr and child_live_pr.get("merged"):
+                    child_mc = child_live_pr.get("merge_commit") or child_local_pr.get("merge_commit")
+                    if child_mc:
+                        if not main_contains_merge(self.project, str(child_mc)) or child_local_pr.get("local_synced") is False:
+                            child_pending_sync = True
+                    elif child_local_pr.get("local_synced") is not True:
+                        child_pending_sync = True
+            if (child_state != "CLOSED" or child_pending_sync) and child_id not in open_sub_issues_list:
+                open_sub_issues_list.append(child_id)
 
         milestone_node = issue.get("milestone")
         milestone = str(milestone_node["title"]) if isinstance(milestone_node, dict) and milestone_node.get("title") else ""
+
+        # Local authorization gate for remote issue Verify commands (bound to exact reviewed issue body).
+        issue_verify_cmds = extract_issue_verify_commands(parsed)
+        body_sha = issue_body_sha256(raw_body)
+        approved = local_state.get("approved_verify")
+        has_local_override = isinstance(overrides.get("verify"), list)
+        approved_matches = (
+            isinstance(approved, dict)
+            and approved.get("body_sha256") == body_sha
+            and approved.get("commands") == issue_verify_cmds
+        )
+        verify_trusted = has_local_override or (not issue_verify_cmds) or approved_matches
+        approved_verify_commands = tuple(approved["commands"]) if approved_matches else ()
+        untrusted_verify_commands = () if verify_trusted else tuple(issue_verify_cmds)
 
         builder = str(overrides.get("builder") or self.project.config.get("default_builder") or "code")
         reviewer = str(overrides.get("reviewer") or self.project.config.get("default_reviewer") or "code-hard")
@@ -982,7 +1256,7 @@ class GitHubTracker:
             "reviewer": reviewer,
             "owns": owns,
             "lane": lane,
-            "verify_extra": parsed["verify_extra"],
+            "verify_extra": [],
         }
         if overrides.get("delegate") is not None:
             fields["delegate"] = overrides["delegate"]
@@ -1002,12 +1276,19 @@ class GitHubTracker:
             pr=pr,
             owns_explicit=owns_explicit,
             parent_id=parent_id,
-            sub_issues=sub_issues,
+            sub_issues=tuple(sub_issues_list),
+            open_sub_issues=tuple(open_sub_issues_list),
+            external_blockers=tuple(external_blockers),
             labels=labels,
             github_state=github_state,
             is_merged=is_merged,
             legacy_wp_id=local_state.get("legacy_wp_id") or parsed["legacy_wp_id"],
             overrides=dict(overrides),
+            verify_trusted=verify_trusted,
+            approved_verify_commands=approved_verify_commands,
+            untrusted_verify_commands=untrusted_verify_commands,
+            public_lane=public_lane,
+            public_status=public_status,
         )
 
     def work_packages(self, *, refresh: bool = False, read_only: bool = False) -> list[wpfile.WorkPackage]:
@@ -1015,13 +1296,28 @@ class GitHubTracker:
         cache = self.load_cache() if read_only else self.sync(force=refresh)
         if not cache:
             return []
+        current_repo = str(cache.get("repo") or self.config.get("repo") or "").strip()
+        project_schema = cache.get("project") if isinstance(cache.get("project"), dict) else None
+        project_id = str(project_schema["id"]) if (project_schema and project_schema.get("id")) else None
+        project_owner = str((project_schema or {}).get("owner") or self.config.get("project_owner") or "").strip() or None
         required_labels = set(self.config.get("issue_labels") or [])
         prs_by_branch: dict[str, dict] = {}
+        prs_by_number: dict[int, dict] = {}
         for pr in cache.get("prs") or []:
-            if isinstance(pr, dict) and pr.get("headRefName"):
+            if not isinstance(pr, dict):
+                continue
+            if pr.get("number") is not None:
+                prs_by_number[int(pr["number"])] = pr
+            if pr.get("headRefName") and _pr_matches_repo_and_base(pr, self.project.main_branch):
                 branch = str(pr["headRefName"])
-                # Keep newest/open or merged PR per branch (list is newest-updated first).
-                prs_by_branch.setdefault(branch, pr)
+                # Prefer open/merged same-repo PR for this branch (list is newest-updated first).
+                if branch not in prs_by_branch:
+                    prs_by_branch[branch] = pr
+        issues_by_number: dict[int, dict] = {
+            int(issue["number"]): issue
+            for issue in (cache.get("issues") or [])
+            if isinstance(issue, dict) and issue.get("number") is not None
+        }
         wps: list[wpfile.WorkPackage] = []
         for issue in cache.get("issues") or []:
             if not isinstance(issue, dict) or issue.get("number") is None:
@@ -1030,7 +1326,15 @@ class GitHubTracker:
                 issue_label_names = {node["name"] for node in (issue.get("labels") or {}).get("nodes") or [] if isinstance(node, dict) and node.get("name")}
                 if not (required_labels & issue_label_names):
                     continue
-            wps.append(self._issue_to_wp(issue, prs_by_branch))
+            wps.append(self._issue_to_wp(
+                issue,
+                prs_by_branch,
+                prs_by_number,
+                current_repo=current_repo,
+                project_id=project_id,
+                project_owner=project_owner,
+                issues_by_number=issues_by_number,
+            ))
         return sorted(wps, key=lambda wp: (wp.issue_number or 0, wp.id))
 
     def _find_cached_issue(self, issue_number: int) -> tuple[dict | None, dict | None]:
@@ -1043,8 +1347,10 @@ class GitHubTracker:
         return cache, None
 
     def _patch_cached_issue(self, issue_number: int, *, add_label: str | None = None, remove_label: str | None = None,
-                            project_number: int | None = None, item_id: str | None = None,
-                            status_field: str | None = None, status_value: str | None = None) -> None:
+                            project_number: int | None = None, project_id: str | None = None,
+                            item_id: str | None = None,
+                            status_field: str | None = None, status_value: str | None = None,
+                            github_state: str | None = None) -> None:
         """Applies our own one-way GitHub mutations into `<runs>/github-cache.json` so subsequent
         transitions and read-only dashboard views see them immediately without an extra GraphQL call."""
         lock_path = self.cache_path.with_suffix(".lock")
@@ -1056,6 +1362,8 @@ class GitHubTracker:
             target = next((item for item in (cache.get("issues") or []) if isinstance(item, dict) and item.get("number") == issue_number), None)
             if target is None:
                 return
+            if github_state:
+                target["state"] = github_state
             if add_label or remove_label:
                 nodes = [n for n in (target.get("labels") or {}).get("nodes", []) if isinstance(n, dict) and n.get("name")]
                 names = {str(n["name"]) for n in nodes}
@@ -1066,9 +1374,26 @@ class GitHubTracker:
                 target["labels"] = {"nodes": nodes}
             if project_number is not None and item_id and status_field and status_value:
                 proj_items = list((target.get("projectItems") or {}).get("nodes") or [])
-                entry = next((it for it in proj_items if isinstance(it, dict) and (it.get("project") or {}).get("number") == project_number), None)
+                entry = next(
+                    (
+                        it for it in proj_items
+                        if isinstance(it, dict) and (
+                            it.get("id") == item_id
+                            or (project_id and (it.get("project") or {}).get("id") == project_id)
+                        )
+                    ),
+                    None,
+                )
+                if entry is None and not project_id:
+                    entry = next(
+                        (it for it in proj_items if isinstance(it, dict) and (it.get("project") or {}).get("number") == project_number),
+                        None,
+                    )
                 if entry is None:
-                    entry = {"id": item_id, "project": {"number": project_number}, "fieldValues": {"nodes": []}}
+                    proj_meta: dict = {"number": project_number}
+                    if project_id:
+                        proj_meta["id"] = project_id
+                    entry = {"id": item_id, "project": proj_meta, "fieldValues": {"nodes": []}}
                     proj_items.append(entry)
                 field_nodes = [v for v in (entry.get("fieldValues") or {}).get("nodes", []) if isinstance(v, dict)]
                 updated_field = False
@@ -1086,11 +1411,12 @@ class GitHubTracker:
             staging.write_text(json.dumps(cache, indent=2) + "\n", encoding="utf-8")
             replace_file(staging, self.cache_path)
 
-    def sync_issue_status(self, wp_id: str, wpo_status: str) -> bool:
+    def sync_issue_status(self, wp_id: str, wpo_status: str, *, strict: bool = False) -> bool:
         """One-way push of WPO status to GitHub Project v2 Status & blocked label.
 
         Never moves a card to Done directly: merging the PR with `Fixes #N` closes the issue and
-        triggers GitHub Project's built-in Done automation.
+        triggers GitHub Project's built-in Done automation. When `strict=True`, raises `GhError`
+        instead of silently skipping missing schema/fields/options or label-edit errors.
         """
         if not self.config.get("sync_board_status", True):
             return False
@@ -1106,12 +1432,12 @@ class GitHubTracker:
             _cache, issue = self._find_cached_issue(issue_number)
             labels = {node["name"] for node in (issue or {}).get("labels", {}).get("nodes", []) if isinstance(node, dict) and node.get("name")}
             if wpo_status == "blocked" and blocked_label not in labels:
-                res = self.gh.run("issue", "edit", str(issue_number), "-R", repo, "--add-label", str(blocked_label), check=False)
+                res = self.gh.run("issue", "edit", str(issue_number), "-R", repo, "--add-label", str(blocked_label), check=strict)
                 if res.returncode == 0:
                     self._patch_cached_issue(issue_number, add_label=str(blocked_label))
                     changed = True
             elif wpo_status != "blocked" and blocked_label in labels:
-                res = self.gh.run("issue", "edit", str(issue_number), "-R", repo, "--remove-label", str(blocked_label), check=False)
+                res = self.gh.run("issue", "edit", str(issue_number), "-R", repo, "--remove-label", str(blocked_label), check=strict)
                 if res.returncode == 0:
                     self._patch_cached_issue(issue_number, remove_label=str(blocked_label))
                     changed = True
@@ -1130,18 +1456,31 @@ class GitHubTracker:
             project_schema = cache.get("project")
             _, issue = self._find_cached_issue(issue_number)
         if not project_schema or not issue:
+            if strict:
+                raise GhError(f"cannot sync board status for {wp_id}: project #{project_number} schema or issue #{issue_number} unavailable")
             return changed
 
         status_field_name = str(self.config.get("status_field") or "Status")
         target_option = (self.config.get("status_map") or {}).get(wpo_status)
         field_info = (project_schema.get("fields") or {}).get(status_field_name)
         if not target_option or not field_info:
+            if strict:
+                raise GhError(f"cannot sync board status for {wp_id}: project field '{status_field_name}' or mapping for '{wpo_status}' missing")
             return changed
         option_id = (field_info.get("options") or {}).get(target_option)
         if not option_id:
+            if strict:
+                raise GhError(f"cannot sync board status for {wp_id}: option '{target_option}' missing on project field '{status_field_name}'")
             return changed
 
-        item_id, current_status, _ = _status_from_project(issue, int(project_number), status_field_name, str(self.config.get("lane_field") or "Lane"))
+        item_id, current_status, _ = _status_from_project(
+            issue,
+            int(project_number),
+            status_field_name,
+            str(self.config.get("lane_field") or "Lane"),
+            project_id=str(project_schema.get("id") or "") or None,
+            project_owner=str(project_schema.get("owner") or self.config.get("project_owner") or "") or None,
+        )
         if current_status == target_option:
             return changed
         if not item_id:
@@ -1153,6 +1492,8 @@ class GitHubTracker:
             )
             item_id = added.get("id") if isinstance(added, dict) else None
         if not item_id:
+            if strict:
+                raise GhError(f"cannot sync board status for {wp_id}: could not resolve project item id")
             return changed
         self.gh.run(
             "project", "item-edit",
@@ -1164,39 +1505,115 @@ class GitHubTracker:
         self._patch_cached_issue(
             issue_number,
             project_number=int(project_number),
+            project_id=str(project_schema.get("id") or "") or None,
             item_id=str(item_id),
             status_field=status_field_name,
             status_value=target_option,
         )
         return True
 
-    def find_open_pr(self, branch: str) -> dict | None:
+    def close_issue_completed(self, wp_id: str, *, commit: str | None = None) -> bool:
+        """Closes a GitHub issue with reason `completed` after verified local-ff merge."""
+        issue_number = wpfile.issue_number_of(wp_id)
+        if issue_number is None:
+            return False
         repo = self.repo()
+        args = ["issue", "close", str(issue_number), "-R", repo, "--reason", "completed"]
+        if commit:
+            args += ["--comment", f"Merged into `{self.project.main_branch}` at `{commit[:10]}`."]
+        self.gh.run(*args)
+        self._patch_cached_issue(issue_number, github_state="CLOSED")
+        return True
+
+    def approve_verify(self, wp_id: str, *, clear: bool = False, refresh: bool = True) -> dict:
+        """Authorizes (or revokes) remote issue `## Verify` commands bound to the current issue body revision."""
+        issue_number = wpfile.issue_number_of(wp_id)
+        if issue_number is None:
+            raise GhError(f"{wp_id} is not a GitHub issue id")
+        run_dir = self.project.wp_run_dir(f"GH-{issue_number}")
+        if clear:
+            run_state.set_approved_verify(run_dir, None)
+            return {"wp": f"GH-{issue_number}", "approved": False, "commands": [], "body_sha256": None}
+        if refresh:
+            self.sync(force=True)
+        _cache, issue = self._find_cached_issue(issue_number)
+        if issue is None:
+            raise GhError(f"GitHub issue #{issue_number} not found in cache")
+        raw_body = str(issue.get("body") or "")
+        parsed = parse_issue_body(raw_body)
+        commands = extract_issue_verify_commands(parsed)
+        digest = issue_body_sha256(raw_body)
+        run_state.set_approved_verify(run_dir, digest, commands)
+        return {"wp": f"GH-{issue_number}", "approved": True, "commands": commands, "body_sha256": digest}
+
+    def find_open_pr(self, branch: str, *, base: str | None = None, head_sha: str | None = None) -> dict | None:
+        repo = self.repo()
+        repo_owner, repo_name = repo.split("/", 1)
+        expected_base = base or self.project.main_branch
         data = self.gh.json(
-            "pr", "list", "-R", repo, "--head", branch, "--state", "open",
-            "--json", "number,url,state,isDraft,headRefName,headRefOid,mergeStateStatus,autoMergeRequest,statusCheckRollup",
+            "pr", "list", "-R", repo, "--base", expected_base, "--head", branch, "--state", "open",
+            "--json",
+            "number,url,state,isDraft,headRefName,headRefOid,baseRefName,baseRefOid,isCrossRepository,"
+            "headRepositoryOwner,headRepository,mergeStateStatus,autoMergeRequest,statusCheckRollup,commits",
         )
-        if isinstance(data, list) and data:
-            return _normalize_pr(data[0])
+        if not isinstance(data, list):
+            return None
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            # Require positive matches on every identity field before reusing/editing an open PR.
+            if item.get("isCrossRepository") is not False:
+                continue
+            if item.get("headRefName") != branch:
+                continue
+            if item.get("baseRefName") != expected_base:
+                continue
+            owner_obj = item.get("headRepositoryOwner")
+            owner_login = owner_obj.get("login") if isinstance(owner_obj, dict) else None
+            if not owner_login or str(owner_login).lower() != repo_owner.lower():
+                continue
+            head_repo = item.get("headRepository")
+            head_repo_name = head_repo.get("name") if isinstance(head_repo, dict) else None
+            if not head_repo_name or str(head_repo_name).lower() != repo_name.lower():
+                continue
+            if head_sha is not None and item.get("headRefOid") != head_sha:
+                continue
+            return _normalize_pr(item)
         return None
 
     def deliver_pr(self, wp: wpfile.WorkPackage, branch: str, head_sha: str, delivery: str,
-                   verify_commands: Iterable[str] = ()) -> PRDeliveryResult:
+                   verify_commands: Iterable[str] = (), *, commits_count: int | None = None,
+                   base_sha: str | None = None, commit_headlines: list[str] | None = None) -> PRDeliveryResult:
         """Creates or updates a sanitized PR for `wp` and arms GitHub auto-merge when configured."""
         repo = self.repo()
         privacy_enabled = bool(self.config.get("privacy_check", True))
-        title = privacy.require_public_safe(wp.title, self.project.root, enabled=privacy_enabled)
-        body = render_pr_body(wp, verify_commands=verify_commands, project_root=self.project.root, privacy_check=privacy_enabled)
+        title = privacy.require_public_safe(
+            wp.title, self.project.root, enabled=privacy_enabled, extra_forbidden=self.extra_forbidden,
+        )
+        body = render_pr_body(
+            wp,
+            verify_commands=verify_commands,
+            project_root=self.project.root,
+            privacy_check=privacy_enabled,
+            extra_forbidden=self.extra_forbidden,
+        )
         draft = delivery == "pr-draft"
 
-        existing = self.find_open_pr(branch)
-        with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".md", delete=False) as handle:
+        # A51: Locate any existing same-repo PR for `(branch, main_branch)` without requiring
+        # `headRefOid == head_sha` immediately after `git push` (GitHub updates `headRefOid`
+        # asynchronously; head integrity on merge is enforced via `--match-head-commit`).
+        existing = self.find_open_pr(branch, base=self.project.main_branch)
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", newline="\n", suffix=".md", delete=False) as handle:
             handle.write(body)
             body_file = Path(handle.name)
         try:
             if existing is not None:
                 pr_number = int(existing["number"])
                 pr_url = str(existing["url"])
+                if commits_count is None and existing.get("commits_count") is not None:
+                    commits_count = int(existing["commits_count"])
+                if commit_headlines is None and existing.get("commit_headlines"):
+                    commit_headlines = list(existing["commit_headlines"])
                 self.gh.run("pr", "edit", str(pr_number), "-R", repo, "--title", title, "--body-file", str(body_file))
                 if not draft and existing.get("draft"):
                     self.gh.run("pr", "ready", str(pr_number), "-R", repo)
@@ -1213,12 +1630,16 @@ class GitHubTracker:
                 created_url = self.gh.run(*args).stdout.strip().splitlines()[-1].strip()
                 pr_info = self.gh.json(
                     "pr", "view", created_url, "-R", repo,
-                    "--json", "number,url,state,isDraft,headRefName,headRefOid,mergeStateStatus,autoMergeRequest",
+                    "--json", "number,url,state,isDraft,headRefName,headRefOid,baseRefName,baseRefOid,mergeStateStatus,autoMergeRequest,commits",
                 )
                 if not isinstance(pr_info, dict) or pr_info.get("number") is None:
                     raise GhError(f"could not read created PR metadata for {created_url}")
                 pr_number = int(pr_info["number"])
                 pr_url = str(pr_info.get("url") or created_url)
+                if commits_count is None and isinstance(pr_info.get("commits"), list):
+                    commits_count = len(pr_info["commits"])
+                if base_sha is None and pr_info.get("baseRefOid"):
+                    base_sha = str(pr_info["baseRefOid"])
         finally:
             body_file.unlink(missing_ok=True)
 
@@ -1227,10 +1648,15 @@ class GitHubTracker:
         merge_commit: str | None = None
         warning: str | None = None
         state = "OPEN"
+        merge_method = str(self.config.get("merge_method") or "squash")
+        direct_merge_attempted = False
+        merge_queued = False
 
         if delivery == "pr-automerge":
-            merge_method = str(self.config.get("merge_method") or "squash")
-            merge_args = ["pr", "merge", str(pr_number), "-R", repo, "--auto", f"--{merge_method}"]
+            merge_args = [
+                "pr", "merge", str(pr_number), "-R", repo,
+                "--auto", f"--{merge_method}", "--match-head-commit", head_sha,
+            ]
             if self.config.get("delete_branch_on_merge", True):
                 merge_args.append("--delete-branch")
             attempt = self.gh.run(*merge_args, check=False)
@@ -1241,13 +1667,15 @@ class GitHubTracker:
                 # Check whether the PR is already clean/mergeable and repo lacks branch rules or auto-merge.
                 fallback = str(self.config.get("auto_merge_fallback") or "wait")
                 if fallback == "direct-merge" and self._can_direct_merge(repo, pr_number):
-                    direct_args = ["pr", "merge", str(pr_number), "-R", repo, f"--{merge_method}"]
+                    direct_args = [
+                        "pr", "merge", str(pr_number), "-R", repo,
+                        f"--{merge_method}", "--match-head-commit", head_sha,
+                    ]
                     if self.config.get("delete_branch_on_merge", True):
                         direct_args.append("--delete-branch")
                     direct = self.gh.run(*direct_args, check=False)
                     if direct.returncode == 0:
-                        merged = True
-                        state = "MERGED"
+                        direct_merge_attempted = True
                     else:
                         warning = f"auto-merge rejected ({detail}); direct merge failed ({(direct.stderr or direct.stdout).strip()})"
                 else:
@@ -1256,10 +1684,11 @@ class GitHubTracker:
                         f"Enable auto-merge (`gh repo edit {repo} --enable-auto-merge`) or set github.auto_merge_fallback='direct-merge'."
                     )
 
-            # Re-read PR state in case GitHub merged it immediately.
+            # Re-read live PR state using CLI-supported fields; only mark MERGED when GitHub confirms
+            # `state == "MERGED"` (a merge-queue admission returns exit 0 while keeping state OPEN).
             view = self.gh.run(
                 "pr", "view", str(pr_number), "-R", repo,
-                "--json", "state,merged,mergedAt,mergeCommit,autoMergeRequest",
+                "--json", "state,mergedAt,mergeCommit,autoMergeRequest,baseRefOid,commits",
                 check=False,
             )
             if view.returncode == 0 and view.stdout.strip():
@@ -1269,23 +1698,53 @@ class GitHubTracker:
                     info = {}
                 if isinstance(info, dict):
                     state = str(info.get("state") or state)
-                    if info.get("merged") or state == "MERGED":
+                    if commits_count is None and isinstance(info.get("commits"), list):
+                        commits_count = len(info["commits"])
+                    if base_sha is None and info.get("baseRefOid"):
+                        base_sha = str(info["baseRefOid"])
+                    if state == "MERGED" or bool(info.get("mergedAt")):
                         merged = True
                         state = "MERGED"
                         commit_obj = info.get("mergeCommit")
                         merge_commit = commit_obj.get("oid") if isinstance(commit_obj, dict) else None
                     elif info.get("autoMergeRequest"):
                         auto_merge_enabled = True
+                    elif direct_merge_attempted:
+                        # Queued in merge queue: stay OPEN and record durable queue state so
+                        # reconciliation does not re-run `gh pr merge` every tick (A41/A58).
+                        merge_queued = True
 
         run_dir = self.project.wp_run_dir(wp.id)
+        # Immutable WPO delivery provenance stored separately from observed PR state (A2).
+        run_state.set_pr_delivery(run_dir, {
+            "repo": repo,
+            "number": pr_number,
+            "base": self.project.main_branch,
+            "base_sha": base_sha,
+            "branch": branch,
+            "verified_head_sha": head_sha,
+            "commits_count": commits_count,
+            "commit_headlines": list(commit_headlines) if commit_headlines else None,
+            "merge_method": merge_method,
+        })
         run_state.set_pr(run_dir, {
+            "delivered_by_wpo": True,
+            "repo": repo,
+            "base": self.project.main_branch,
+            "base_sha": base_sha,
             "number": pr_number,
             "url": pr_url,
             "branch": branch,
             "head_sha": head_sha,
+            "verified_head_sha": head_sha,
+            "commits_count": commits_count,
+            "commit_headlines": list(commit_headlines) if commit_headlines else None,
+            "merge_method": merge_method,
             "state": state,
             "draft": draft,
             "auto_merge": auto_merge_enabled,
+            "merge_queued": merge_queued,
+            "merge_queued_head_sha": head_sha if merge_queued else None,
             "merged": merged,
             "merge_commit": merge_commit,
             "warning": warning,
@@ -1347,30 +1806,91 @@ def main_contains_merge(project: Project, merge_commit: str | None) -> bool:
     return git(project.root, "merge-base", "--is-ancestor", merge_commit, project.main_branch, check=False).returncode == 0
 
 
-def local_main_matches_remote(project: Project) -> bool:
-    """Whether local `main` is on the main branch, clean, and matches `<remote>/<main>`."""
-    remote = str(project.github_config.get("remote") or "origin")
-    main = project.main_branch
-    if git(project.root, "symbolic-ref", "--short", "HEAD", check=False).stdout.strip() != main:
-        return False
-    if git(project.root, "status", "--porcelain", check=False).stdout.strip():
-        return False
-    local_head = git(project.root, "rev-parse", main, check=False)
-    remote_head = git(project.root, "rev-parse", f"{remote}/{main}", check=False)
-    return local_head.returncode == 0 and remote_head.returncode == 0 and local_head.stdout.strip() == remote_head.stdout.strip()
+def _registered_linked_worktrees(project: Project) -> set[Path]:
+    """Paths of linked git worktrees registered under `project.root` (excluding the main checkout)."""
+    listed = git(project.root, "worktree", "list", "--porcelain", check=False)
+    if listed.returncode != 0:
+        return set()
+    main_resolved = project.root.resolve()
+    result: set[Path] = set()
+    for line in listed.stdout.splitlines():
+        if line.startswith("worktree "):
+            candidate = Path(line[len("worktree "):].strip()).resolve()
+            if candidate != main_resolved:
+                result.add(candidate)
+    return result
 
 
 def _cleanup_merged_worktree(context, wp_id: str, pr_info: dict) -> None:
-    """Removes a standalone worktree and its merged local branch once local `main` has the merge.
-    Never touches T3-owned worktrees or branches."""
-    if context.machine.execution_mode == "t3":
-        return
+    """Safely removes a WPO-owned standalone worktree and its merged local branch once local `main`
+    contains the merge. Verifies persisted standalone ownership, linked worktree identity, expected
+    checked-out branch, clean/no-untracked state, and that the current tip actually landed."""
     project = context.project
+    run_dir = project.wp_run_dir(wp_id)
+    if context.machine.execution_mode == "t3" or (run_dir / "t3-workspace.json").is_file():
+        return
+    local_state = run_state.load(run_dir)
+    if local_state.get("worktree_owner") != "standalone":
+        wt_candidate = project.worktree(wp_id)
+        if wt_candidate.exists():
+            context.journal.emit(
+                "cleanup-skipped",
+                f"{wp_id} merged, but worktree {wt_candidate} lacks persisted standalone ownership; retained",
+                {"wp": wp_id},
+            )
+        return
+
     wt = project.worktree(wp_id)
-    branch = str(pr_info.get("branch") or project.branch(wp_id))
-    head_sha = pr_info.get("head_sha")
+    branch = str(pr_info.get("branch") or local_state.get("branch") or project.branch(wp_id))
+    # Accept ONLY the actual landed head (never an older `verified_head_sha` when a different head landed).
+    landed_head = str(pr_info.get("head_sha") or "").strip()
+
     if wt.exists():
-        removed = git(project.root, "worktree", "remove", "--force", str(wt), check=False)
+        wt_resolved = wt.resolve()
+        if local_state.get("worktree") and Path(local_state["worktree"]).resolve() != wt_resolved:
+            context.journal.emit(
+                "cleanup-skipped",
+                f"{wp_id} merged, but worktree path {wt} does not match recorded standalone checkout; retained",
+                {"wp": wp_id},
+            )
+            return
+        if wt_resolved == project.root.resolve() or wt_resolved not in _registered_linked_worktrees(project):
+            context.journal.emit(
+                "cleanup-skipped",
+                f"{wp_id} merged, but {wt} is not a registered linked worktree of {project.root}; retained",
+                {"wp": wp_id},
+            )
+            return
+        checked_out = git(wt, "symbolic-ref", "--short", "HEAD", check=False)
+        if checked_out.returncode != 0 or checked_out.stdout.strip() != branch:
+            context.journal.emit(
+                "cleanup-skipped",
+                f"{wp_id} merged, but worktree {wt} is on '{checked_out.stdout.strip() or 'detached HEAD'}' instead of '{branch}'; retained",
+                {"wp": wp_id},
+            )
+            return
+        dirty = git(wt, "status", "--porcelain", "--untracked-files=all", check=False)
+        if dirty.returncode != 0 or dirty.stdout.strip():
+            context.journal.emit(
+                "cleanup-skipped",
+                f"{wp_id} merged, but standalone worktree {wt} has uncommitted or untracked files; retained",
+                {"wp": wp_id},
+            )
+            return
+        wt_head_res = git(wt, "rev-parse", "HEAD", check=False)
+        wt_head = wt_head_res.stdout.strip() if wt_head_res.returncode == 0 else ""
+        head_is_merged = (
+            bool(wt_head and landed_head and wt_head == landed_head)
+            or (bool(wt_head) and git(project.root, "merge-base", "--is-ancestor", wt_head, project.main_branch, check=False).returncode == 0)
+        )
+        if not head_is_merged:
+            context.journal.emit(
+                "cleanup-skipped",
+                f"{wp_id} merged, but worktree {wt} HEAD ({wt_head[:10] or 'unknown'}) does not match the landed head; retained",
+                {"wp": wp_id},
+            )
+            return
+        removed = git(project.root, "worktree", "remove", str(wt), check=False)
         if removed.returncode != 0:
             context.journal.emit(
                 "cleanup-failed",
@@ -1378,13 +1898,22 @@ def _cleanup_merged_worktree(context, wp_id: str, pr_info: dict) -> None:
                 {"wp": wp_id},
             )
             return
+
     branch_ref = git(project.root, "rev-parse", "--verify", f"refs/heads/{branch}", check=False)
     if branch_ref.returncode != 0:
         return
-    # Squash merges are not git ancestors of main; only force-delete the local branch when its tip
-    # still matches the exact PR HEAD that merged (otherwise keep any newer local commits safe).
-    flag = "-D" if (head_sha and branch_ref.stdout.strip() == head_sha) else "-d"
-    deleted = git(project.root, "branch", "--quiet", flag, branch, check=False)
+    branch_tip = branch_ref.stdout.strip()
+    if landed_head and branch_tip == landed_head:
+        deleted = git(project.root, "branch", "--quiet", "-D", branch, check=False)
+    elif git(project.root, "merge-base", "--is-ancestor", branch_tip, project.main_branch, check=False).returncode == 0:
+        deleted = git(project.root, "branch", "--quiet", "-d", branch, check=False)
+    else:
+        context.journal.emit(
+            "cleanup-skipped",
+            f"{wp_id} merged, but branch {branch} ({branch_tip[:10]}) does not match the landed head; retained",
+            {"wp": wp_id},
+        )
+        return
     if deleted.returncode != 0:
         context.journal.emit(
             "cleanup-failed",
@@ -1403,7 +1932,7 @@ class MainSyncResult:
 
 def _merge_pr_records(local_pr: dict | None, live_pr: dict, **extra: object) -> dict:
     """Merges live PR fields onto stored local PR metadata without clobbering known non-null
-    fields (such as `merge_commit`, `hooks_ran`, `pre_sync_sha`, `local_synced`) with `None`."""
+    fields (such as `merge_commit`, `hooks_ran`, `pre_sync_sha`, `local_synced`, `delivered_by_wpo`) with `None`."""
     merged = dict(local_pr or {})
     for key, val in live_pr.items():
         if val is not None or key not in merged:
@@ -1416,8 +1945,6 @@ def _merge_pr_records(local_pr: dict | None, live_pr: dict, **extra: object) -> 
 
 def sync_local_main(context) -> MainSyncResult:
     """Fetches `origin/<main>` and fast-forwards the main checkout when clean and on `main`."""
-    from .platform import NamedMutex
-
     project = context.project
     remote = str(project.github_config.get("remote") or "origin")
     main = project.main_branch
@@ -1450,6 +1977,180 @@ def _main_checkout_clean_on_main(project: Project) -> bool:
     return not git(project.root, "status", "--porcelain", check=False).stdout.strip()
 
 
+POST_MERGE_HOOKS_JOURNAL = "post-merge-hooks.json"
+POST_MERGE_HOOKS_LOCK = "post-merge-hooks.lock"
+
+
+def _load_hook_journal(runs_dir: Path) -> dict[str, dict]:
+    path = runs_dir / POST_MERGE_HOOKS_JOURNAL
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _save_hook_journal(runs_dir: Path, journal: dict[str, dict]) -> None:
+    path = runs_dir / POST_MERGE_HOOKS_JOURNAL
+    path.parent.mkdir(parents=True, exist_ok=True)
+    staging = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    staging.write_text(json.dumps(journal, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    replace_file(staging, path)
+
+
+def reconcile_hook_journal(runs_dir: Path, *, key: str | None = None, action: str = "list") -> dict:
+    """Inspects or reconciles interrupted entries in `<runs>/post-merge-hooks.json` (A50).
+
+    `action`: `"list"`, `"mark-done"` (marks an interrupted hook completed after manual
+    verification), or `"retry"` (clears the interrupted entry so the next reconcile runs it).
+    """
+    runs_dir.mkdir(parents=True, exist_ok=True)
+    with FileLock(runs_dir / POST_MERGE_HOOKS_LOCK):
+        journal = _load_hook_journal(runs_dir)
+        if action == "list":
+            return {"action": "list", "entries": journal}
+        if not key or key not in journal:
+            raise GhError(f"hook journal entry not found: {key!r}")
+        if action == "mark-done":
+            entry = dict(journal[key]) if isinstance(journal[key], dict) else {}
+            entry.update(status="done", ok=True, reconciled_manually=True, finished_at=time.time())
+            journal[key] = entry
+            _save_hook_journal(runs_dir, journal)
+            return {"action": "mark-done", "key": key, "entry": entry}
+        if action == "retry":
+            removed = journal.pop(key)
+            _save_hook_journal(runs_dir, journal)
+            return {"action": "retry", "key": key, "removed": removed}
+        raise GhError(f"unknown hook journal action: {action!r}")
+
+
+def _fetch_pr_commit_evidence(
+    context,
+    current_pr: dict,
+    *,
+    force_live: bool = False,
+) -> tuple[str | None, int | None, list[str] | None, str | None, str | None]:
+    """Queries GitHub for `(merge_commit, commits_count, commit_headlines, base_sha, head_sha)`.
+
+    When `force_live=True` (used for single-parent landings so post-delivery human commits on the
+    PR never leave stale delivery-time headlines/counts), live PR metadata overrides stored values.
+    """
+    merge_commit = current_pr.get("merge_commit")
+    commits_count = current_pr.get("commits_count")
+    commit_headlines = current_pr.get("commit_headlines")
+    base_sha = current_pr.get("base_sha")
+    head_sha = current_pr.get("head_sha")
+    tracker = getattr(context, "tracker", None)
+    pr_number = current_pr.get("number")
+    need_query = (
+        force_live
+        or (not merge_commit)
+        or (not isinstance(commits_count, int))
+        or (isinstance(commits_count, int) and commits_count > 1 and not commit_headlines)
+    )
+    if need_query and tracker is not None and pr_number is not None:
+        try:
+            repo = tracker.repo()
+            view = tracker.gh.run(
+                "pr", "view", str(pr_number), "-R", repo,
+                "--json", "mergeCommit,commits,baseRefOid,headRefOid", check=False,
+            )
+            if view.returncode == 0 and view.stdout.strip():
+                parsed_view = json.loads(view.stdout)
+                if isinstance(parsed_view, dict):
+                    mc_obj = parsed_view.get("mergeCommit")
+                    if isinstance(mc_obj, dict) and mc_obj.get("oid") and (force_live or not merge_commit):
+                        merge_commit = str(mc_obj["oid"])
+                    if parsed_view.get("baseRefOid") and (force_live or not base_sha):
+                        base_sha = str(parsed_view["baseRefOid"])
+                    if parsed_view.get("headRefOid") and (force_live or not head_sha):
+                        head_sha = str(parsed_view["headRefOid"])
+                    commits_raw = parsed_view.get("commits")
+                    if isinstance(commits_raw, list) and commits_raw:
+                        commits_count = len(commits_raw)
+                        headlines = [str(c.get("messageHeadline") or "").strip() for c in commits_raw if isinstance(c, dict)]
+                        if headlines and all(headlines):
+                            commit_headlines = headlines
+                        elif force_live:
+                            commit_headlines = None
+        except (GhError, ValueError):
+            pass
+    return (
+        str(merge_commit) if merge_commit else None,
+        int(commits_count) if isinstance(commits_count, int) and commits_count >= 1 else None,
+        list(commit_headlines) if isinstance(commit_headlines, list) and commit_headlines else None,
+        str(base_sha) if base_sha else None,
+        str(head_sha) if head_sha else None,
+    )
+
+
+def _resolve_merge_hook_base(context, project: Project, current_pr: dict, merge_commit: str) -> str | None:
+    """Determines the exact landed base commit before `merge_commit` from git graph & live PR
+    commit evidence (never guessing from local merge_method preference), returning `None` when ambiguous."""
+    parents_res = git(project.root, "rev-list", "--parents", "-n", "1", merge_commit, check=False)
+    if parents_res.returncode != 0 or not parents_res.stdout.strip():
+        return None
+    parts = parents_res.stdout.strip().split()
+    parents = parts[1:]
+    if not parents:
+        return None
+    # 1. True 2-parent merge commit: first parent is `main` before the merge (unambiguous).
+    if len(parents) >= 2:
+        return parents[0]
+
+    # A20: Fetch live merged PR commits & headRefOid so post-delivery commits pushed to the PR
+    # never get masked by stale delivery-time `commits_count` / `commit_headlines`.
+    _mc, commits_count, commit_headlines, base_sha, head_sha = _fetch_pr_commit_evidence(
+        context, current_pr, force_live=True,
+    )
+    # 2. Single-commit PR: squash and rebase both land exactly 1 commit (`merge_commit^1`).
+    if commits_count == 1:
+        return parents[0]
+    if not isinstance(commits_count, int) or commits_count < 1:
+        return None
+
+    # 3. Multi-commit single-parent landing (N > 1): prove whether it was squashed (1 commit) or
+    # rebased/fast-forwarded (N commits) from commit graph & PR commit headlines; defer if ambiguous.
+    n_base_res = git(project.root, "rev-parse", "--verify", f"{merge_commit}~{commits_count}", check=False)
+    n_base = n_base_res.stdout.strip() if n_base_res.returncode == 0 and n_base_res.stdout.strip() else None
+
+    if n_base is None:
+        # Fewer than N ancestors exist on main -> cannot be an N-commit rebase; must be a squash!
+        return parents[0]
+
+    # If `base_sha` is known and is NOT an ancestor of `merge_commit~N`, going back N commits
+    # reaches commits from BEFORE the PR's base -> cannot be an N-commit rebase; proven squash!
+    if (
+        base_sha
+        and git(project.root, "cat-file", "-e", f"{base_sha}^{{commit}}", check=False).returncode == 0
+        and git(project.root, "merge-base", "--is-ancestor", base_sha, n_base, check=False).returncode != 0
+    ):
+        return parents[0]
+
+    # Exact fast-forward / unmodified tip match: `merge_commit == head_sha` proves all N commits landed!
+    if head_sha and merge_commit == head_sha:
+        return n_base
+
+    # Compare the N commit subjects ending at `merge_commit` against the PR's N commit headlines.
+    if commit_headlines and len(commit_headlines) == commits_count:
+        log_res = git(project.root, "log", "--format=%s", "-n", str(commits_count), merge_commit, check=False)
+        if log_res.returncode == 0:
+            landed_subjects = list(reversed(log_res.stdout.splitlines()))
+            if landed_subjects == commit_headlines:
+                return n_base
+            # Subjects do not match an N-commit rebase; confirm squash if tip subject differs from last PR commit
+            # or carries GitHub's `(#N)` squash suffix.
+            tip_subject = landed_subjects[-1] if landed_subjects else ""
+            pr_num = current_pr.get("number")
+            if tip_subject != commit_headlines[-1] or (pr_num is not None and f"(#{pr_num})" in tip_subject):
+                return parents[0]
+
+    # Ambiguous multi-commit single-parent landing: defer rather than running hooks over the wrong diff.
+    return None
+
+
 def finalize_merged_pr(
     context,
     wp_id: str,
@@ -1461,93 +2162,246 @@ def finalize_merged_pr(
     cleanup_fn: Callable[[], None] | None = None,
     ran_hook_ranges: set[tuple[str, str]] | None = None,
 ) -> bool:
-    """Verifies the main checkout is clean on `main` and contains the merged PR, runs
-    `post_merge_hooks` once over the exact merged range (`pre_sync_sha..post_sync_sha`,
-    `sync_result.before..sync_result.after`, or `merge_commit^1..merge_commit`), cleans up
-    standalone worktrees/branches and build outputs, and marks `local_synced = True`."""
+    """Serialized under `project.integration_mutex`: re-reads durable PR state inside the lock,
+    verifies the main checkout is clean on `main` and contains the merged PR, proves the exact
+    landed commit range, journals each post-merge hook BEFORE execution and marks it done right
+    after (surfacing interrupted invocations instead of blindly re-running them), cleans up
+    verified standalone checkouts, and checkpoints `hooks_ran` and `local_synced`."""
     project = context.project
     run_dir = project.wp_run_dir(wp_id)
-    if not _main_checkout_clean_on_main(project):
-        return False
-    merge_commit = pr_info.get("merge_commit")
-    synced = (
-        main_contains_merge(project, str(merge_commit))
-        if merge_commit
-        else (sync_result.fetched and local_main_matches_remote(project))
-    )
-    if not synced:
-        return False
 
-    if not pr_info.get("hooks_ran"):
-        if not project.config["post_merge_hooks"]:
-            run_state.set_pr(run_dir, {"hooks_ran": True})
+    with NamedMutex(project.integration_mutex):
+        stored_state = run_state.load(run_dir)
+        stored_pr = stored_state.get("pr")
+        # Durable state loaded inside the lock MUST win over any pre-lock `pr_info` snapshot.
+        current_pr = _merge_pr_records(pr_info, stored_pr or {})
+        # Enrich with delivery metadata ONLY when PR number AND head SHA still match delivery (A20).
+        delivery_rec = stored_state.get("pr_delivery")
+        if (
+            isinstance(delivery_rec, dict)
+            and delivery_rec.get("number") == current_pr.get("number")
+            and delivery_rec.get("verified_head_sha")
+            and delivery_rec.get("verified_head_sha") == current_pr.get("head_sha")
+        ):
+            for key in ("commits_count", "base_sha", "commit_headlines"):
+                if current_pr.get(key) is None and delivery_rec.get(key) is not None:
+                    current_pr[key] = delivery_rec[key]
+        if current_pr.get("local_synced"):
+            return True
+        if not _main_checkout_clean_on_main(project):
+            return False
+
+        merge_commit = current_pr.get("merge_commit")
+        if not merge_commit:
+            fetched_mc, fetched_cnt, fetched_hl, fetched_base, _fetched_head = _fetch_pr_commit_evidence(context, current_pr)
+            if fetched_mc:
+                merge_commit = fetched_mc
+                current_pr["merge_commit"] = fetched_mc
+                patch: dict[str, object] = {"merge_commit": fetched_mc}
+                if fetched_cnt is not None and current_pr.get("commits_count") is None:
+                    current_pr["commits_count"] = fetched_cnt
+                    patch["commits_count"] = fetched_cnt
+                if fetched_hl is not None and current_pr.get("commit_headlines") is None:
+                    current_pr["commit_headlines"] = fetched_hl
+                    patch["commit_headlines"] = fetched_hl
+                if fetched_base is not None and current_pr.get("base_sha") is None:
+                    current_pr["base_sha"] = fetched_base
+                    patch["base_sha"] = fetched_base
+                run_state.set_pr(run_dir, patch)
+
+        synced = main_contains_merge(project, str(merge_commit)) if merge_commit else False
+        if not synced:
+            return False
+
+        if not current_pr.get("hooks_ran"):
+            hooks_cfg = project.config["post_merge_hooks"]
+            if not hooks_cfg:
+                run_state.set_pr(run_dir, {"hooks_ran": True})
+            else:
+                hook_base = _resolve_merge_hook_base(context, project, current_pr, str(merge_commit))
+                if not hook_base:
+                    # Ambiguous landed range: defer hooks rather than running over wrong/unrelated commits.
+                    return False
+                hook_after = str(merge_commit)
+                hook_range = (hook_base, hook_after)
+                if ran_hook_ranges is None or hook_range not in ran_hook_ranges:
+                    from .commands import run_commands
+                    changed = git(project.root, "diff", "--name-only", hook_base, hook_after).stdout.splitlines()
+                    target_log = log_path or (project.runs_dir / "post-merge.log")
+                    hook_lock = FileLock(project.runs_dir / POST_MERGE_HOOKS_LOCK)
+                    for idx, hook in enumerate(hooks_cfg):
+                        patterns = [wpfile.glob_to_regex(pattern) for pattern in hook["when_changed"]]
+                        if not any(pattern.match(path) for path in changed for pattern in patterns):
+                            continue
+                        key = f"{hook_base}..{hook_after}::{idx}::{hook['command']}"
+                        with hook_lock:
+                            journal = _load_hook_journal(project.runs_dir)
+                            existing = journal.get(key)
+                            if isinstance(existing, dict):
+                                if existing.get("status") == "done":
+                                    continue
+                                if existing.get("status") == "running":
+                                    # Previous process crashed mid-hook after potential side effect:
+                                    # surface ONCE with recovery CLI commands (A19/A50).
+                                    if not existing.get("alerted"):
+                                        journal[key] = {**existing, "alerted": True}
+                                        _save_hook_journal(project.runs_dir, journal)
+                                        quoted_key = shlex.quote(key)
+                                        context.journal.emit(
+                                            "integration-failed",
+                                            (
+                                                f"{wp_id}: post-merge hook '{hook['command']}' was interrupted mid-execution ({key}); "
+                                                f"reconcile with `wpo ledger hooks --mark-done {quoted_key}` or `wpo ledger hooks --retry {quoted_key}`"
+                                            ),
+                                            {"wp": wp_id},
+                                        )
+                                    return False
+                            journal[key] = {
+                                "status": "running",
+                                "wp": wp_id,
+                                "range": f"{hook_base}..{hook_after}",
+                                "command": hook["command"],
+                                "started_at": time.time(),
+                                "alerted": False,
+                            }
+                            _save_hook_journal(project.runs_dir, journal)
+                        failures = run_commands(
+                            project.config["shell"], [hook["command"]], project.root,
+                            project.env_for(None), target_log, project.config["command_timeout_minutes"],
+                        )
+                        with hook_lock:
+                            journal = _load_hook_journal(project.runs_dir)
+                            journal[key] = {
+                                **(journal.get(key) if isinstance(journal.get(key), dict) else {}),
+                                "status": "done",
+                                "ok": not failures,
+                                "finished_at": time.time(),
+                            }
+                            _save_hook_journal(project.runs_dir, journal)
+                        if log_fn is not None:
+                            log_fn(f"post-merge hook '{hook['command']}': {'failed' if failures else 'ok'}")
+                        if failures:
+                            context.journal.emit(
+                                "integration-failed",
+                                f"{wp_id} merged, but post-merge hook '{hook['command']}' failed (log {target_log})",
+                                {"wp": wp_id},
+                            )
+                    if ran_hook_ranges is not None:
+                        ran_hook_ranges.add(hook_range)
+                run_state.set_pr(run_dir, {"hooks_ran": True})
+
+        if cleanup_fn is not None:
+            cleanup_fn()
         else:
-            hook_base: str | None = None
-            hook_after: str | None = None
-            if merge_commit:
-                parent = git(project.root, "rev-parse", "--verify", f"{merge_commit}^1", check=False)
-                if parent.returncode == 0 and parent.stdout.strip():
-                    hook_base = parent.stdout.strip()
-                    hook_after = str(merge_commit)
-            if not hook_base and not merge_commit:
-                if pr_info.get("pre_sync_sha"):
-                    hook_base = str(pr_info["pre_sync_sha"])
-                    hook_after = str(pr_info.get("post_sync_sha") or "HEAD")
-                elif sync_result.moved and sync_result.before:
-                    hook_base = str(sync_result.before)
-                    hook_after = str(sync_result.after or "HEAD")
-            if not hook_base or not hook_after:
-                # Cannot determine changed files for configured post-merge hooks yet; retry later.
-                return False
-            hook_range = (hook_base, hook_after)
-            if ran_hook_ranges is None or hook_range not in ran_hook_ranges:
-                from .integrate import run_post_merge_hooks
-                run_post_merge_hooks(context, hook_base, log_path=log_path, after=hook_after, wp_id=wp_id, log_fn=log_fn)
-                if ran_hook_ranges is not None:
-                    ran_hook_ranges.add(hook_range)
-            run_state.set_pr(run_dir, {"hooks_ran": True})
+            from .integrate import cleanup_merged_outputs
+            _cleanup_merged_worktree(context, wp_id, current_pr)
+            cleanup_merged_outputs(context, wp_id)
+        run_state.set_pr(run_dir, {"local_synced": True})
+        return True
 
-    if cleanup_fn is not None:
-        cleanup_fn()
-    else:
-        from .integrate import cleanup_merged_outputs
-        _cleanup_merged_worktree(context, wp_id, pr_info)
-        cleanup_merged_outputs(context, wp_id)
-    run_state.set_pr(run_dir, {"local_synced": True})
-    return True
+
+def is_wpo_delivered_pr(local_state: dict, live_pr: dict | None, *, repo: str, main_branch: str) -> bool:
+    """Checks immutable WPO delivery provenance (`state.json['pr_delivery']`) against `live_pr`
+    for the exact repository, PR number, base branch, same-repo flag, and verified head SHA."""
+    if not isinstance(local_state, dict) or not isinstance(live_pr, dict):
+        return False
+    delivery = local_state.get("pr_delivery")
+    if not isinstance(delivery, dict):
+        return False
+    if str(delivery.get("repo") or "").lower() != repo.lower():
+        return False
+    if delivery.get("number") is None or delivery.get("number") != live_pr.get("number"):
+        return False
+    if str(delivery.get("base") or "") != main_branch:
+        return False
+    if live_pr.get("base") and str(live_pr["base"]) != main_branch:
+        return False
+    if live_pr.get("is_cross_repository"):
+        return False
+    verified_head = str(delivery.get("verified_head_sha") or "").strip()
+    return bool(verified_head and live_pr.get("head_sha") == verified_head)
 
 
 def reconcile_open_prs(context, *, force_sync: bool = True) -> dict:
-    """Refreshes GitHub state and reconciles open WPO pull requests.
-
-    - Newly merged PRs: record GitHub merge, emit `wp-merged`, and retry local `main` fast-forward,
-      post-merge hooks, and worktree/build cleanup until local `main` actually contains the merge
-      commit (`local_synced = True`).
-    - Failed CI or merge conflicts: emit `pr-checks-failed` once per head SHA.
-    - Direct-merge fallback: when `mergeStateStatus == 'CLEAN'` and checks succeed on a PR where
-      `--auto` wasn't available and `auto_merge_fallback == 'direct-merge'`, merge it now.
-    """
+    """Refreshes GitHub state and reconciles open WPO pull requests & pending local-ff issue closes."""
     if not context.project.is_github or context.tracker is None:
-        return {"merged": [], "failed_checks": [], "open": [], "pending_local_sync": []}
+        return {
+            "merged": [], "failed_checks": [], "open": [], "closed_unmerged": [],
+            "pending_local_sync": [], "pending_issue_close": [],
+        }
     tracker: GitHubTracker = context.tracker
     tracker.sync(force=force_sync)
     wps = tracker.work_packages(read_only=True)
+    cache = tracker.load_cache() or {}
+    cached_pr_numbers: set[int] = {
+        int(pr["number"]) for pr in (cache.get("prs") or [])
+        if isinstance(pr, dict) and pr.get("number") is not None
+    }
+    for issue_node in cache.get("issues") or []:
+        if not isinstance(issue_node, dict):
+            continue
+        for pr_node in (issue_node.get("closedByPullRequestsReferences") or {}).get("nodes") or []:
+            if isinstance(pr_node, dict) and pr_node.get("number") is not None:
+                cached_pr_numbers.add(int(pr_node["number"]))
+    repo = tracker.repo()
     merged_now: list[str] = []
     pending_local_sync: list[tuple[str, dict]] = []
     failed_checks: list[str] = []
     still_open: list[str] = []
+    closed_unmerged: list[str] = []
+    pending_issue_close: list[str] = []
 
     for wp in wps:
         run_dir = context.project.runs_dir / wp.id
         local_state = run_state.load(run_dir)
+
+        # A18: Retry any persisted pending GitHub issue close from verified `local-ff` delivery.
+        if local_state.get("pending_issue_close"):
+            if wp.github_state == "CLOSED":
+                run_state.clear_pending_issue_close(run_dir)
+            else:
+                try:
+                    tracker.close_issue_completed(wp.id, commit=local_state.get("local_ff_commit"))
+                    run_state.clear_pending_issue_close(run_dir)
+                except GhError as error:
+                    pending_issue_close.append(wp.id)
+                    context.journal.emit(
+                        "github-sync-failed",
+                        f"{wp.id}: retrying GitHub issue close after local-ff merge failed: {error}",
+                        {"wp": wp.id},
+                    )
+
         local_pr = local_state.get("pr")
         live_pr = wp.pr
         if not live_pr and not local_pr:
             continue
+        # If local state thinks a tracked PR is still OPEN and it did not appear in the synced cache,
+        # query GitHub directly to catch terminal CLOSED/MERGED transitions outside the top-200 window.
+        if (
+            isinstance(local_pr, dict)
+            and local_pr.get("state") == "OPEN"
+            and local_pr.get("number") is not None
+            and int(local_pr["number"]) not in cached_pr_numbers
+        ):
+            view = tracker.gh.run(
+                "pr", "view", str(local_pr["number"]), "-R", repo,
+                "--json", "state,mergedAt,mergeCommit,autoMergeRequest,baseRefName,baseRefOid,headRefName,headRefOid,isCrossRepository,isDraft,mergeStateStatus,statusCheckRollup,commits",
+                check=False,
+            )
+            if view.returncode == 0 and view.stdout.strip():
+                try:
+                    parsed_view = json.loads(view.stdout)
+                except ValueError:
+                    parsed_view = None
+                if isinstance(parsed_view, dict) and parsed_view.get("state"):
+                    parsed_view.setdefault("number", local_pr["number"])
+                    parsed_view.setdefault("url", local_pr.get("url"))
+                    live_pr = _normalize_pr(parsed_view)
+
         merged_before = bool(local_pr and local_pr.get("merged"))
         local_synced_before = bool(local_pr and local_pr.get("local_synced"))
         if live_pr and (live_pr.get("merged") or live_pr.get("state") == "MERGED"):
-            pr_record = _merge_pr_records(local_pr, live_pr, merged=True, state="MERGED")
+            pr_record = _merge_pr_records(local_pr, live_pr, merged=True, state="MERGED", merge_queued=False, merge_queued_head_sha=None)
             if not merged_before:
                 pr_record["local_synced"] = False
                 pr_record.setdefault("hooks_ran", False)
@@ -1560,13 +2414,72 @@ def reconcile_open_prs(context, *, force_sync: bool = True) -> dict:
                 run_state.set_pr(run_dir, pr_record)
                 pending_local_sync.append((wp.id, pr_record))
             continue
+        if live_pr and live_pr.get("state") == "CLOSED" and not live_pr.get("merged"):
+            pr_record = _merge_pr_records(local_pr, live_pr, state="CLOSED", merged=False, auto_merge=False, merge_queued=False, merge_queued_head_sha=None)
+            pr_num = live_pr.get("number")
+            if (local_pr or {}).get("closed_notified_number") != pr_num:
+                pr_record["closed_notified_number"] = pr_num
+                context.journal.emit(
+                    "pr-closed-unmerged",
+                    f"{wp.id} PR #{pr_num} was closed without merging ({live_pr.get('url', '')})",
+                    {"wp": wp.id},
+                )
+            run_state.set_pr(run_dir, pr_record)
+            closed_unmerged.append(wp.id)
+            continue
         if live_pr and live_pr.get("state") == "OPEN":
             still_open.append(wp.id)
-            run_state.set_pr(run_dir, _merge_pr_records(local_pr, live_pr))
             head_sha = live_pr.get("head_sha")
+            was_queued_for_head = bool(
+                (local_pr or {}).get("merge_queued")
+                and head_sha
+                and (local_pr or {}).get("merge_queued_head_sha") == head_sha
+            )
+            already_queued = was_queued_for_head
+            dequeued_now = False
+            if was_queued_for_head:
+                # A63: Verify the PR is still actually in GitHub's merge queue (`isInMergeQueue`);
+                # if dropped from the queue while staying OPEN on the same head, clear `merge_queued`
+                # and surface an explicit `pr-checks-failed` alert so the lane never hangs forever.
+                in_queue = live_pr.get("in_merge_queue")
+                if in_queue is None and live_pr.get("number") is not None:
+                    try:
+                        q_owner, q_name = repo.split("/", 1)
+                        q_data = tracker.gh.graphql(
+                            PR_MERGE_QUEUE_GRAPHQL,
+                            {"owner": q_owner, "name": q_name, "number": int(live_pr["number"])},
+                        )
+                        pr_node = (q_data.get("repository") or {}).get("pullRequest")
+                        if isinstance(pr_node, dict) and "isInMergeQueue" in pr_node:
+                            in_queue = pr_node["isInMergeQueue"]
+                    except GhError:
+                        in_queue = None
+                if in_queue is False:
+                    already_queued = False
+                    dequeued_now = True
+            prev_removed_sha = (local_pr or {}).get("merge_queue_removed_head_sha")
+            removed_for_head = bool(head_sha and prev_removed_sha == head_sha) or dequeued_now
+            run_state.set_pr(
+                run_dir,
+                _merge_pr_records(
+                    local_pr,
+                    live_pr,
+                    merge_queued=already_queued,
+                    merge_queued_head_sha=head_sha if already_queued else None,
+                    merge_queue_removed_head_sha=head_sha if removed_for_head else None,
+                ),
+            )
             check_state = live_pr.get("check_state")
             merge_state = live_pr.get("merge_state_status")
-            if check_state in ("FAILURE", "ERROR") or merge_state == "DIRTY":
+            if dequeued_now:
+                if prev_removed_sha != head_sha:
+                    context.journal.emit(
+                        "pr-checks-failed",
+                        f"{wp.id} PR #{live_pr.get('number')} was removed from the merge queue ({live_pr.get('url', '')})",
+                        {"wp": wp.id},
+                    )
+                    failed_checks.append(wp.id)
+            elif check_state in ("FAILURE", "ERROR") or merge_state == "DIRTY":
                 if (local_pr or {}).get("last_failed_check_sha") != head_sha:
                     reason = "merge conflict with base branch" if merge_state == "DIRTY" else f"CI checks reported {check_state}"
                     run_state.set_pr(run_dir, {"last_failed_check_sha": head_sha})
@@ -1579,51 +2492,88 @@ def reconcile_open_prs(context, *, force_sync: bool = True) -> dict:
             elif (
                 context.project.delivery_mode == "pr-automerge"
                 and not live_pr.get("auto_merge")
+                and not already_queued
+                and not removed_for_head
                 and str(context.project.github_config.get("auto_merge_fallback") or "wait") == "direct-merge"
                 and _is_direct_merge_ready(merge_state, check_state)
+                and is_wpo_delivered_pr(local_state, live_pr, repo=repo, main_branch=context.project.main_branch)
             ):
-                repo = tracker.repo()
+                delivery_rec = local_state["pr_delivery"]
+                verified_head = str(delivery_rec["verified_head_sha"])
                 merge_method = str(context.project.github_config.get("merge_method") or "squash")
-                args = ["pr", "merge", str(live_pr["number"]), "-R", repo, f"--{merge_method}"]
+                args = [
+                    "pr", "merge", str(live_pr["number"]), "-R", repo,
+                    f"--{merge_method}", "--match-head-commit", verified_head,
+                ]
                 if context.project.github_config.get("delete_branch_on_merge", True):
                     args.append("--delete-branch")
                 attempt = tracker.gh.run(*args, check=False)
                 if attempt.returncode == 0:
+                    # A41: Confirm live PR state via `gh pr view` (exit 0 can mean merge-queue admission).
+                    confirmed_state = "OPEN"
+                    confirmed_merged = False
                     merge_commit = None
-                    view = tracker.gh.run("pr", "view", str(live_pr["number"]), "-R", repo, "--json", "mergeCommit", check=False)
+                    commits_count = live_pr.get("commits_count")
+                    commit_headlines = live_pr.get("commit_headlines")
+                    view = tracker.gh.run(
+                        "pr", "view", str(live_pr["number"]), "-R", repo,
+                        "--json", "state,mergedAt,mergeCommit,autoMergeRequest,commits", check=False,
+                    )
                     if view.returncode == 0 and view.stdout.strip():
                         try:
                             info = json.loads(view.stdout)
-                            if isinstance(info, dict) and isinstance(info.get("mergeCommit"), dict):
-                                merge_commit = info["mergeCommit"].get("oid")
+                            if isinstance(info, dict):
+                                confirmed_state = str(info.get("state") or confirmed_state)
+                                confirmed_merged = (confirmed_state == "MERGED") or bool(info.get("mergedAt"))
+                                if isinstance(info.get("mergeCommit"), dict):
+                                    merge_commit = info["mergeCommit"].get("oid")
+                                if isinstance(info.get("commits"), list) and info["commits"]:
+                                    commits_count = len(info["commits"])
+                                    hl = [str(c.get("messageHeadline") or "").strip() for c in info["commits"] if isinstance(c, dict)]
+                                    if hl and all(hl):
+                                        commit_headlines = hl
                         except ValueError:
                             pass
-                    pr_record = _merge_pr_records(
-                        local_pr, live_pr,
-                        merged=True, state="MERGED", merge_commit=merge_commit, local_synced=False, hooks_ran=False,
-                    )
-                    run_state.set_pr(run_dir, pr_record)
-                    run_state.set_status(run_dir, "done")
-                    merged_now.append(wp.id)
-                    still_open.remove(wp.id)
-                    pending_local_sync.append((wp.id, pr_record))
-                    context.journal.emit("wp-merged", f"{wp.id} merged via PR #{live_pr.get('number')} ({live_pr.get('url', '')})", {"wp": wp.id})
+                    if confirmed_merged:
+                        pr_record = _merge_pr_records(
+                            local_pr, live_pr,
+                            merged=True, state="MERGED", merge_commit=merge_commit,
+                            merge_method=merge_method, commits_count=commits_count,
+                            commit_headlines=commit_headlines,
+                            merge_queued=False, merge_queued_head_sha=None,
+                            local_synced=False, hooks_ran=False,
+                        )
+                        run_state.set_pr(run_dir, pr_record)
+                        run_state.set_status(run_dir, "done")
+                        merged_now.append(wp.id)
+                        still_open.remove(wp.id)
+                        pending_local_sync.append((wp.id, pr_record))
+                        context.journal.emit("wp-merged", f"{wp.id} merged via PR #{live_pr.get('number')} ({live_pr.get('url', '')})", {"wp": wp.id})
+                    else:
+                        # A41/A58: Queued in merge queue or awaiting GitHub merge: keep pending as
+                        # OPEN with durable `merge_queued` flag so direct merge does not re-fire every tick.
+                        run_state.set_pr(
+                            run_dir,
+                            _merge_pr_records(
+                                local_pr, live_pr,
+                                state=confirmed_state, merged=False,
+                                merge_queued=True, merge_queued_head_sha=head_sha,
+                            ),
+                        )
 
     still_pending_sync: list[str] = []
     if pending_local_sync:
         sync_result = sync_local_main(context)
-        if sync_result.moved and sync_result.before:
-            for wp_id, pr_info in pending_local_sync:
-                if not pr_info.get("hooks_ran") and not pr_info.get("merge_commit") and not pr_info.get("pre_sync_sha"):
-                    pr_info["pre_sync_sha"] = sync_result.before
-                    pr_info["post_sync_sha"] = sync_result.after
-                    run_state.set_pr(
-                        context.project.wp_run_dir(wp_id),
-                        {"pre_sync_sha": sync_result.before, "post_sync_sha": sync_result.after},
-                    )
         ran_hook_ranges: set[tuple[str, str]] = set()
         for wp_id, pr_info in pending_local_sync:
             if not finalize_merged_pr(context, wp_id, pr_info, sync_result, ran_hook_ranges=ran_hook_ranges):
                 still_pending_sync.append(wp_id)
 
-    return {"merged": merged_now, "failed_checks": failed_checks, "open": still_open, "pending_local_sync": still_pending_sync}
+    return {
+        "merged": merged_now,
+        "failed_checks": failed_checks,
+        "open": still_open,
+        "closed_unmerged": closed_unmerged,
+        "pending_local_sync": still_pending_sync,
+        "pending_issue_close": pending_issue_close,
+    }

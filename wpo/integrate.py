@@ -229,10 +229,13 @@ class Integration:
     def post_merge(self, before: str) -> None:
         run_post_merge_hooks(self.context, before, self.log_path, wp_id=self.wp_id, log_fn=self.log)
 
-    def cleanup(self) -> None:
+    def cleanup(self, *, landed_tip: str | None = None) -> None:
         """Removes the worktree, branch and build output after main moved."""
         if self.context.machine.execution_mode == "t3":
             self.log("retained T3-owned worktree and branch; their lifecycle belongs to T3")
+        elif self.project.is_github:
+            from .github import _cleanup_merged_worktree
+            _cleanup_merged_worktree(self.context, self.wp_id, {"branch": self.branch, "head_sha": landed_tip})
         else:
             self.cleanup_standalone_worktree()
         cleanup_merged_outputs(self.context, self.wp_id, self.log)
@@ -245,6 +248,132 @@ class Integration:
             self.log(f"cleanup failed: {error}")
             self.context.journal.emit("cleanup-failed", f"{self.wp_id} merged into main, but removing its worktree or branch failed: {error}", {"wp": self.wp_id})
 
+    def _check_outgoing_commits_privacy(self, base_ref: str, head_sha: str, *, enabled: bool, extra_forbidden: tuple[str, ...] = ()) -> None:
+        """Fails closed: inspects EVERY outgoing commit in `base_ref..head_sha` (commit messages,
+        touched files, legacy WP files, in-repo ledger paths, and every hunk-added diff line) before `git push`."""
+        if not enabled:
+            return
+        from .privacy import PrivacyError, check_code_diff_text, check_public_text
+        from .project import ProjectError
+
+        try:
+            regular_commits = [
+                line.strip()
+                for line in git(self.worktree, "rev-list", "--no-merges", f"{base_ref}..{head_sha}").stdout.splitlines()
+                if line.strip()
+            ]
+            merge_commits = [
+                line.strip()
+                for line in git(self.worktree, "rev-list", "--merges", f"{base_ref}..{head_sha}").stdout.splitlines()
+                if line.strip()
+            ]
+        except ProjectError as error:
+            raise PrivacyError([f"could not enumerate outgoing commits for privacy check: {error}"]) from error
+
+        ledger_prefixes = [".orchestration/runs", ".orchestration/tasks"]
+        resolved_root = self.project.root.resolve()
+        resolved_runs = self.project._resolve_runs_dir().resolve()
+        if resolved_runs.is_relative_to(resolved_root):
+            rel_runs = resolved_runs.relative_to(resolved_root).as_posix().strip("/")
+            if rel_runs and rel_runs not in ledger_prefixes:
+                ledger_prefixes.append(rel_runs)
+
+        wp_dir_rel = self.project.wp_dir_relative
+        violations: list[str] = []
+        private_wp_sections = ("Progress log", "Handoff", "Review", "Re-evaluation", "Try it")
+        private_wp_front_keys = ("builder", "reviewer", "delegate", "mode", "skills")
+
+        def _extract_added_lines(patch_text: str, *, combined: bool = False) -> str:
+            # A49: Track hunk boundaries (`@@` / `@@@`) so file headers (`+++ b/...`) are skipped
+            # while real added lines starting with `++` (emitted as `+++...` in hunks) ARE scanned.
+            added_chunks: list[str] = []
+            in_hunk = False
+            for line in patch_text.splitlines():
+                if line.startswith(("diff --git ", "diff --cc ", "diff --combined ")):
+                    in_hunk = False
+                elif line.startswith("@@"):
+                    in_hunk = True
+                elif in_hunk:
+                    if combined:
+                        # Combined diff (`--cc`) prefixes lines with one column per parent (e.g. `++`, `+ `, ` +`).
+                        if len(line) >= 2 and "+" in line[:2]:
+                            added_chunks.append(line.lstrip("+- "))
+                        elif line.startswith(("-", " ", "\\")):
+                            continue
+                        else:
+                            in_hunk = False
+                    elif line.startswith("+"):
+                        added_chunks.append(line[1:])
+                    elif line.startswith(("-", " ", "\\")):
+                        continue
+                    else:
+                        in_hunk = False
+            return "\n".join(added_chunks)
+
+        # A61 + A66: Scan every non-merge commit introduced by this branch with `--text --no-textconv --no-ext-diff`
+        # (so binary blobs and `.gitattributes binary/-diff` files are scanned too), and for merge commits
+        # (such as `merge_main`), scan commit messages + `--cc` conflict resolutions only so clean incoming
+        # changes already on `main` never block this branch.
+        commit_specs = [(sha, False) for sha in regular_commits] + [(sha, True) for sha in merge_commits]
+        for sha, is_merge in commit_specs:
+            short = sha[:10]
+            try:
+                commit_msg = git(self.worktree, "show", "-s", "--format=%B", sha).stdout
+                if is_merge:
+                    touched = git(
+                        self.worktree, "diff-tree", "--cc", "--no-commit-id", "--name-only", "-r", sha,
+                    ).stdout.splitlines()
+                    patch_text = git(
+                        self.worktree, "show", "--cc", "--text", "--no-textconv", "--no-ext-diff",
+                        "--format=", "-U0", "--no-color", sha,
+                    ).stdout
+                else:
+                    touched = git(
+                        self.worktree, "diff-tree", "--no-commit-id", "--name-only", "-r", "--diff-filter=ACMR", sha,
+                    ).stdout.splitlines()
+                    patch_text = git(
+                        self.worktree, "show", "--text", "--no-textconv", "--no-ext-diff",
+                        "--format=", "-U0", "--no-color", sha,
+                    ).stdout
+            except ProjectError as error:
+                raise PrivacyError([f"could not inspect outgoing commit {short} for privacy safety: {error}"]) from error
+
+            for issue in check_code_diff_text(commit_msg, self.project.root, resolved_runs, extra_forbidden=extra_forbidden):
+                violations.append(f"commit {short} message: {issue}")
+
+            for raw_path in touched:
+                rel = raw_path.replace("\\", "/").strip()
+                if not rel:
+                    continue
+                if any(rel == prefix or rel.startswith(prefix + "/") for prefix in ledger_prefixes):
+                    violations.append(f"commit {short}: private ledger/task artifact ({rel})")
+                    continue
+                if self.project.is_github and wpfile.is_wp_file(rel, wp_dir_rel) and not rel.endswith(f"/{wpfile.TEMPLATE_NAME}"):
+                    try:
+                        text = git(self.worktree, "show", f"{sha}:{rel}").stdout
+                    except ProjectError as error:
+                        raise PrivacyError([f"could not read outgoing WP blob {short}:{rel}: {error}"]) from error
+                    try:
+                        parsed = wpfile.parse_text(text, self.worktree / rel, retain_body=True)
+                    except wpfile.WorkPackageError:
+                        parsed = None
+                    if parsed is not None:
+                        if any(key in parsed.fields for key in private_wp_front_keys):
+                            violations.append(f"commit {short}: legacy WP file carries private routing front matter ({rel})")
+                        for sec in private_wp_sections:
+                            if any(line.strip() and not line.strip().startswith("<!--") for line in parsed.section(sec)):
+                                violations.append(f"commit {short}: legacy WP file carries private '## {sec}' content ({rel})")
+                                break
+                    for issue in check_public_text(text, project_root=None, allow_local_paths=False, extra_forbidden=extra_forbidden):
+                        violations.append(f"commit {short} ({rel}): {issue}")
+
+            added_lines = _extract_added_lines(patch_text, combined=is_merge)
+            for issue in check_code_diff_text(added_lines, self.project.root, resolved_runs, extra_forbidden=extra_forbidden):
+                violations.append(f"commit {short} diff: {issue}")
+
+        if violations:
+            raise PrivacyError(list(dict.fromkeys(violations)))
+
     def _deliver_pr(self, wp: wpfile.WorkPackage, delivery: str) -> int:
         """Pushes the verified branch, opens/updates a sanitized PR (`Fixes #N`), and arms auto-merge."""
         from . import run_state
@@ -256,7 +385,11 @@ class Integration:
             render_pr_body,
             sync_local_main,
         )
-        from .privacy import PrivacyError, require_public_safe
+        from .privacy import (
+            PrivacyError,
+            private_route_identifiers,
+            require_public_safe,
+        )
 
         remote = str(self.project.github_config.get("remote") or "origin")
         # Refresh remote base branch when reachable; fall back to local main if no remote ref exists yet.
@@ -269,29 +402,52 @@ class Integration:
         if merged == EXIT_CONFLICT:
             return EXIT_CONFLICT
 
+        # A21: Pin candidate HEAD and tree BEFORE verification so a concurrent commit cannot slip in.
+        candidate_head = git(self.worktree, "rev-parse", "HEAD").stdout.strip()
+        candidate_tree = git(self.worktree, "rev-parse", "HEAD^{tree}").stdout.strip()
+
         must_verify = self.force_verify or bool(merged) or not self.rounds_ran_the_full_checks(wp) or not self.verified_tree_matches()
         if must_verify and not self.verify(base_ref):
             self.log("workspace verification failed; PR not pushed")
             return EXIT_VERIFY_FAILED
 
+        head_sha = git(self.worktree, "rev-parse", "HEAD").stdout.strip()
+        current_tree = git(self.worktree, "rev-parse", "HEAD^{tree}").stdout.strip()
+        if head_sha != candidate_head or current_tree != candidate_tree or git(self.worktree, "status", "--porcelain", "--untracked-files=all").stdout.strip():
+            self.log(f"worktree changed during verification ({candidate_head[:10]} -> {head_sha[:10]}); PR not pushed")
+            return EXIT_VERIFY_FAILED
+
         verify_cmds = self.last_verified_commands or wp.round_checks(self.project.config["verify_round"], self.project.config["verify_workspace"])
         actual_branch = git(self.worktree, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
-        head_sha = git(self.worktree, "rev-parse", "HEAD").stdout.strip()
-        if git(self.worktree, "rev-list", "--count", f"{base_ref}..HEAD").stdout.strip() == "0":
+        commits_count = int(git(self.worktree, "rev-list", "--count", f"{base_ref}..{head_sha}").stdout.strip())
+        if commits_count == 0:
             self.log(f"branch {actual_branch} has no commits ahead of {base_ref}; refusing empty PR")
             return EXIT_FAST_FORWARD_FAILED
+        base_sha_res = git(self.worktree, "merge-base", base_ref, head_sha, check=False)
+        base_sha = base_sha_res.stdout.strip() if base_sha_res.returncode == 0 else None
+        commit_headlines = list(reversed(
+            git(self.worktree, "log", "--format=%s", f"{base_ref}..{head_sha}").stdout.splitlines()
+        ))
 
-        # Validate outbound PR text before pushing so privacy violations fail fast with zero remote side effects.
+        # Validate outbound PR text AND every outgoing commit before pushing so privacy violations fail fast.
         privacy_enabled = bool(self.project.github_config.get("privacy_check", True))
+        extra_forbidden = private_route_identifiers(self.context.machine, self.project, getattr(self.context, "router", None))
         try:
-            require_public_safe(wp.title, self.project.root, enabled=privacy_enabled)
-            render_pr_body(wp, verify_commands=verify_cmds, project_root=self.project.root, privacy_check=privacy_enabled)
+            require_public_safe(wp.title, self.project.root, enabled=privacy_enabled, extra_forbidden=extra_forbidden)
+            render_pr_body(
+                wp,
+                verify_commands=verify_cmds,
+                project_root=self.project.root,
+                privacy_check=privacy_enabled,
+                extra_forbidden=extra_forbidden,
+            )
+            self._check_outgoing_commits_privacy(base_ref, head_sha, enabled=privacy_enabled, extra_forbidden=extra_forbidden)
         except PrivacyError as error:
             self.log(f"PR delivery refused before push: {error}")
             self.context.journal.emit("integration-failed", f"{self.wp_id}: PR delivery failed: {error}", {"wp": self.wp_id})
             return EXIT_FAST_FORWARD_FAILED
 
-        pushed = git(self.worktree, "push", "-u", remote, f"HEAD:{actual_branch}", check=False)
+        pushed = git(self.worktree, "push", "-u", remote, f"{head_sha}:refs/heads/{actual_branch}", check=False)
         if pushed.returncode != 0:
             self.log(f"git push to {remote}/{actual_branch} failed: {(pushed.stderr or pushed.stdout).strip()}")
             return EXIT_FAST_FORWARD_FAILED
@@ -300,9 +456,19 @@ class Integration:
         tracker = self.context.tracker or GitHubTracker(
             self.project,
             GhClient(str(self.context.machine.raw.get("gh", "gh")), cwd=self.project.root),
+            extra_forbidden=extra_forbidden,
         )
         try:
-            result = tracker.deliver_pr(wp, actual_branch, head_sha, delivery, verify_commands=verify_cmds)
+            result = tracker.deliver_pr(
+                wp,
+                actual_branch,
+                head_sha,
+                delivery,
+                verify_commands=verify_cmds,
+                commits_count=commits_count,
+                base_sha=base_sha,
+                commit_headlines=commit_headlines,
+            )
         except (GhError, PrivacyError) as error:
             self.log(f"PR delivery failed: {error}")
             self.context.journal.emit("integration-failed", f"{self.wp_id}: PR delivery failed: {error}", {"wp": self.wp_id})
@@ -316,10 +482,6 @@ class Integration:
             sync_result = sync_local_main(self.context)
             run_dir = self.project.wp_run_dir(self.wp_id)
             pr_record = dict(run_state.load(run_dir).get("pr") or {})
-            if sync_result.moved and sync_result.before and not pr_record.get("merge_commit") and not pr_record.get("pre_sync_sha"):
-                pr_record["pre_sync_sha"] = sync_result.before
-                pr_record["post_sync_sha"] = sync_result.after
-                run_state.set_pr(run_dir, {"pre_sync_sha": sync_result.before, "post_sync_sha": sync_result.after})
             finalize_merged_pr(
                 self.context,
                 self.wp_id,
@@ -327,7 +489,6 @@ class Integration:
                 sync_result,
                 log_path=self.log_path,
                 log_fn=self.log,
-                cleanup_fn=self.cleanup,
             )
             return EXIT_MERGED
 
@@ -341,6 +502,11 @@ class Integration:
         return EXIT_PR_OPENED
 
     def run(self) -> int:
+        from . import run_state
+        with run_state.ledger_writer(self.project, "integrate", self.wp_id):
+            return self._run_locked()
+
+    def _run_locked(self) -> int:
         outstanding, delegation = unsettled(self.context, self.wp_id)
         if delegation:
             raise RuntimeError(f"{self.wp_id}'s delegated workers are not settled; run the WP (its runner stops its workers), then integrate")
@@ -395,7 +561,23 @@ class Integration:
         else:
             raise RuntimeError("integration loop ended undecided; its last attempt verifies under the mutex")
         self.post_merge(before)
-        self.cleanup()
+        if self.project.is_github:
+            from . import run_state
+            run_dir = self.project.wp_run_dir(self.wp_id)
+            run_state.set_local_ff_merged(run_dir, tip, pending_issue_close=True)
+            if self.context.tracker is not None:
+                from .github import GhError
+                try:
+                    self.context.tracker.close_issue_completed(self.wp_id, commit=tip)
+                    run_state.clear_pending_issue_close(run_dir)
+                except GhError as error:
+                    self.log(f"warning: local-ff merged {self.wp_id}, but closing GitHub issue failed (will retry on reconcile): {error}")
+                    self.context.journal.emit(
+                        "github-sync-failed",
+                        f"{self.wp_id} merged locally ({tip[:10]}), but closing GitHub issue failed (queued for retry): {error}",
+                        {"wp": self.wp_id},
+                    )
+        self.cleanup(landed_tip=tip)
         return EXIT_MERGED
 
 

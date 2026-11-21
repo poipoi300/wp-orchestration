@@ -70,11 +70,18 @@ class WorkPackage:
     owns_explicit: bool = True
     parent_id: str | None = None
     sub_issues: tuple[str, ...] = ()
+    open_sub_issues: tuple[str, ...] = ()
+    external_blockers: tuple[dict, ...] = ()
     labels: tuple[str, ...] = ()
     github_state: str | None = None
     is_merged: bool = False
     legacy_wp_id: str | None = None
     overrides: dict = field(default_factory=dict, repr=False)
+    verify_trusted: bool = True
+    approved_verify_commands: tuple[str, ...] = ()
+    untrusted_verify_commands: tuple[str, ...] = ()
+    public_lane: str = ""
+    public_status: str = ""
 
     @property
     def is_github(self) -> bool:
@@ -149,6 +156,9 @@ class WorkPackage:
     def verify_commands(self) -> list[str]:
         if isinstance(self.overrides.get("verify"), list):
             return [str(cmd).strip() for cmd in self.overrides["verify"] if str(cmd).strip()]
+        if self.is_github:
+            # Execute strictly the exact locally authorized command list (never re-parse rendered markdown).
+            return list(self.approved_verify_commands) if self.verify_trusted else []
         commands, in_fence = [], False
         for line in self.section("Verify"):
             if line.startswith("```"):
@@ -196,11 +206,12 @@ def newline_of(text: str) -> str:
 
 
 def parse(path: Path) -> WorkPackage:
-    return parse_text(read_text(path), path)
+    return parse_text(read_text(path), path, retain_body=False)
 
 
-def parse_text(text: str, path: Path) -> WorkPackage:
-    """Parses WP text; `path` names the file it came from (or stands for, when read from git)."""
+def parse_text(text: str, path: Path, *, retain_body: bool = True) -> WorkPackage:
+    """Parses WP text; `path` names the file it came from (or stands for, when read from git).
+    Retains `text` in memory by default so git blobs never fall back to reading a dirty checkout."""
     lines = text.splitlines()
     if len(lines) < 3 or lines[0].strip() != "---":
         raise WorkPackageError(f"{path.name}: missing front matter opening '---'")
@@ -220,7 +231,7 @@ def parse_text(text: str, path: Path) -> WorkPackage:
             raise WorkPackageError(f"{path.name}: '{name}' must be an inline list like [a, b]")
     if fields["status"] not in STATUSES:
         raise WorkPackageError(f"{path.name}: invalid status '{fields['status']}'")
-    return WorkPackage(path, fields)
+    return WorkPackage(path, fields, body_text=text if retain_body else None)
 
 
 def all_in(directory: Path) -> list[WorkPackage]:
