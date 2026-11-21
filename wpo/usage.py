@@ -17,16 +17,19 @@ import json
 import re
 import statistics
 import subprocess
+import uuid
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from .platform import FileLock, replace_file
 from .project import Project
 from .whats_new import merged_wps
 
 SKILL_ROOT = Path(__file__).resolve().parent.parent
 INDEX_VERSION = 1
+INDEX_LOCK_FILE = "index.lock"
 SESSION_LOG = re.compile(r"^(?P<stem>[^.]+)\.(?P<route>.+?)(?P<resumed>\.resumed)?\.log$")
 CLAUDE_CLI_ROUTE_PREFIXES = ("claude-", "gpt-", "local-")
 # Project files whose changes alter what sessions are told or how they run.
@@ -196,24 +199,40 @@ def load_sessions(project: Project) -> list[SessionRecord]:
     """Every session record, re-parsing only logs that changed since the index was written."""
     runs = project.runs_dir
     index_path = runs / "usage" / "index.json"
-    index = json.loads(index_path.read_text(encoding="utf-8")) if index_path.exists() else {}
-    if index.get("version") != INDEX_VERSION:
-        index = {"version": INDEX_VERSION, "logs": {}}
-    fresh: dict[str, dict] = {}
-    records: list[SessionRecord] = []
-    for path in session_logs(runs):
-        key = path.relative_to(runs).as_posix()
-        status = path.stat()
-        cached = index["logs"].get(key)
-        if cached and cached["size"] == status.st_size and cached["mtime"] == status.st_mtime:
-            record = SessionRecord(**cached["record"]) if cached["record"] else None
-        else:
-            record = read_session(path, runs)
-        fresh[key] = {"size": status.st_size, "mtime": status.st_mtime, "record": asdict(record) if record else None}
-        if record is not None:
-            records.append(record)
-    index_path.parent.mkdir(parents=True, exist_ok=True)
-    index_path.write_text(json.dumps({"version": INDEX_VERSION, "logs": fresh}), encoding="utf-8")
+    lock_path = runs / "usage" / INDEX_LOCK_FILE
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with FileLock(lock_path):
+        index = json.loads(index_path.read_text(encoding="utf-8")) if index_path.exists() else {}
+        if index.get("version") != INDEX_VERSION:
+            index = {"version": INDEX_VERSION, "logs": {}}
+        fresh: dict[str, dict] = {}
+        records: list[SessionRecord] = []
+        seen_keys: set[str] = set()
+        for path in session_logs(runs):
+            key = path.relative_to(runs).as_posix()
+            seen_keys.add(key)
+            status = path.stat()
+            cached = index["logs"].get(key)
+            if cached and cached["size"] == status.st_size and cached["mtime"] == status.st_mtime:
+                record = SessionRecord(**cached["record"]) if cached["record"] else None
+            else:
+                record = read_session(path, runs)
+            entry = {"size": status.st_size, "mtime": status.st_mtime, "record": asdict(record) if record else None}
+            if isinstance(cached, dict) and cached.get("pruned"):
+                entry["pruned"] = True
+            fresh[key] = entry
+            if record is not None:
+                records.append(record)
+        # Keep aggregate records whose raw transcript was explicitly pruned via `wpo ledger prune`.
+        for key, cached in index["logs"].items():
+            if key in seen_keys or not isinstance(cached, dict) or not cached.get("pruned"):
+                continue
+            fresh[key] = cached
+            if cached.get("record"):
+                records.append(SessionRecord(**cached["record"]))
+        staging = index_path.with_name(f".{index_path.name}.{uuid.uuid4().hex}.tmp")
+        staging.write_text(json.dumps({"version": INDEX_VERSION, "logs": fresh}), encoding="utf-8")
+        replace_file(staging, index_path)
     return sorted(records, key=lambda record: record.started)
 
 

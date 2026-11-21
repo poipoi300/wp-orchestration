@@ -14,7 +14,9 @@
   "claude": "claude",
   "agy": "agy",
   "opencode": "opencode",
+  "gh": "gh",
   "state_dir": "~/.local/state/wp-orchestration",
+  "data_dir": "~/.local/share/wp-orchestration",
   "shim_dir": "~/.local/bin",
   "reviewer_agent": "~/.config/wp-orchestration/reviewer.md",
   "skills": {

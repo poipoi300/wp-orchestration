@@ -20,6 +20,29 @@ LIST_FIELDS = ("depends_on", "owns")
 FIELD_PATTERN = re.compile(r"^([a-z_]+):\s*(.*)$")
 STATUS_LINE = re.compile(r"(?m)^status:[ \t]*\S+")
 TEMPLATE_NAME = "WP-TEMPLATE.md"
+VALID_ID = re.compile(r"^(?:WP|GH)-[A-Za-z0-9_.-]+$")
+ISSUE_NUMBER_SHORTHAND = re.compile(r"^#?(\d+)$")
+
+
+def normalize_wp_id(value: str, *, is_github: bool = False) -> str:
+    """Normalizes `#42`, `42` or `gh-42` to `GH-42` for GitHub-tracked projects while preserving WP-* ids."""
+    stripped = value.strip()
+    if stripped.lower().startswith("gh-") and stripped[3:].isdigit():
+        return f"GH-{int(stripped[3:])}"
+    if is_github and (match := ISSUE_NUMBER_SHORTHAND.fullmatch(stripped)):
+        return f"GH-{int(match.group(1))}"
+    return stripped
+
+
+def is_valid_wp_id(value: str) -> bool:
+    return bool(VALID_ID.fullmatch(value))
+
+
+def issue_number_of(wp_id: str) -> int | None:
+    normalized = normalize_wp_id(wp_id, is_github=True)
+    if normalized.startswith("GH-") and normalized[3:].isdigit():
+        return int(normalized[3:])
+    return None
 
 
 class WorkPackageError(Exception):
@@ -35,10 +58,27 @@ def _parse_value(raw: str) -> str | list[str]:
 
 @dataclass
 class WorkPackage:
-    """One parsed WP file. Re-read it after any session that may have edited it."""
+    """One parsed work item (a WP markdown file or a GitHub issue with local split state)."""
 
     path: Path
     fields: dict = field(repr=False)
+    source: str = "wp-file"
+    body_text: str | None = field(default=None, repr=False)
+    issue_number: int | None = None
+    url: str | None = None
+    pr: dict | None = None
+    owns_explicit: bool = True
+    parent_id: str | None = None
+    sub_issues: tuple[str, ...] = ()
+    labels: tuple[str, ...] = ()
+    github_state: str | None = None
+    is_merged: bool = False
+    legacy_wp_id: str | None = None
+    overrides: dict = field(default_factory=dict, repr=False)
+
+    @property
+    def is_github(self) -> bool:
+        return self.source == "github"
 
     @property
     def id(self) -> str:
@@ -99,18 +139,26 @@ class WorkPackage:
         return self.path.name
 
     def text(self) -> str:
+        if self.body_text is not None:
+            return self.body_text
         return read_text(self.path)
 
     def section(self, heading: str) -> list[str]:
         return section_lines(self.text(), heading)
 
     def verify_commands(self) -> list[str]:
+        if isinstance(self.overrides.get("verify"), list):
+            return [str(cmd).strip() for cmd in self.overrides["verify"] if str(cmd).strip()]
         commands, in_fence = [], False
         for line in self.section("Verify"):
             if line.startswith("```"):
                 in_fence = not in_fence
             elif in_fence and line.strip() and not line.strip().startswith("#"):
                 commands.append(line.strip())
+        extra = self.fields.get("verify_extra") or []
+        for command in extra:
+            if command not in commands:
+                commands.append(command)
         return commands
 
     def round_checks(self, round_checks: list[str], merge_checks: Iterable[str] = ()) -> list[str]:
@@ -270,9 +318,14 @@ def glob_to_regex(pattern: str) -> re.Pattern:
 
 
 def path_owned(relative_path: str, wp: WorkPackage, wp_dir_relative: str, shared_files: Iterable[str]) -> bool:
-    """Whether a WP may change this repo-relative path: its owns, its own file, the shared files."""
+    """Whether a WP may change this repo-relative path: its owns, its own file (for wp-file WPs),
+    the shared files. GitHub-backed tasks without explicit `owns` are unrestricted unless required."""
     path = relative_path.replace("\\", "/")
-    if path == f"{wp_dir_relative}/{wp.file_name}" or path in set(shared_files):
+    if path in set(shared_files):
+        return True
+    if not wp.is_github and path == f"{wp_dir_relative}/{wp.file_name}":
+        return True
+    if not wp.owns_explicit:
         return True
     return any(glob_to_regex(pattern).match(path) for pattern in wp.owns)
 

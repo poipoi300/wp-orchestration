@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -17,10 +18,56 @@ from pathlib import Path
 CONFIG_RELATIVE_PATH = Path(".orchestration") / "config.json"
 # Lead-authored task specs inside a worktree; projects gitignore it with `.orchestration/runs/`.
 TASKS_RELATIVE_PATH = Path(".orchestration") / "tasks"
+TRACKERS = ("wp-files", "github")
+DELIVERY_MODES = ("auto", "local-ff", "pr", "pr-draft", "pr-automerge")
+MERGE_METHODS = ("squash", "merge", "rebase")
+AUTO_MERGE_FALLBACKS = ("wait", "direct-merge")
+DEFAULT_DATA_DIR = Path("~/.local/share/wp-orchestration")
+
+GITHUB_DEFAULTS: dict = {
+    "repo": None,
+    "remote": "origin",
+    "project_number": None,
+    "project_owner": None,
+    "status_field": "Status",
+    "status_map": {
+        "todo": "Todo",
+        "in_progress": "In Progress",
+        "review": "In Review",
+        "changes_requested": "In Progress",
+        "blocked": "Blocked",
+        "done": "Done",
+    },
+    "lane_field": "Lane",
+    "lane_label_prefix": "lane:",
+    "blocked_label": "blocked",
+    "issue_labels": [],
+    "cache_ttl_seconds": 60,
+    "poll_seconds": 60,
+    "merge_method": "squash",
+    "delete_branch_on_merge": True,
+    "auto_merge_fallback": "wait",
+    "privacy_check": True,
+    "sync_board_status": True,
+    "transcript_retention_days": None,
+}
 
 DEFAULTS: dict = {
+    # Task tracker: "wp-files" (committed WP-*.md files) or "github" (GitHub Issues + Projects v2 + private local ledger).
+    "tracker": "wp-files",
+    # How finished tasks land: "auto" ("local-ff" for wp-files, "pr-automerge" for github),
+    # "local-ff", "pr", "pr-draft", or "pr-automerge".
+    "delivery": "auto",
+    # Whether tasks without explicit owns globs fail verification. Null defaults to true for wp-files, false for github.
+    "require_owns": None,
+    # Default builder/reviewer tiers and lane when a GitHub issue does not name them locally.
+    "default_builder": "code",
+    "default_reviewer": "code-hard",
+    "default_lane": "",
+    "github": GITHUB_DEFAULTS,
     "wp_dir": "docs/plan/wp",
     "worktrees_root": None,  # default: ../<main checkout name>-worktrees
+    # Run state and private transcripts: repo-relative path, absolute/`~` path, or "external" (under machine data_dir).
     "runs_dir": ".orchestration/runs",
     "main_branch": "main",
     "branch_prefix": "wp/",
@@ -260,9 +307,11 @@ class Project:
     root: Path
     config: dict
     execution_mode: str = "standalone"
+    data_dir: Path = DEFAULT_DATA_DIR
 
     @classmethod
-    def locate(cls, start: Path | None = None, machine_defaults: dict | None = None, execution_mode: str = "standalone") -> Project:
+    def locate(cls, start: Path | None = None, machine_defaults: dict | None = None, execution_mode: str = "standalone",
+               data_dir: Path | None = None) -> Project:
         root = main_checkout_of((start or Path.cwd()).resolve())
         config_path = root / CONFIG_RELATIVE_PATH
         if not config_path.exists():
@@ -273,15 +322,74 @@ class Project:
         unknown = (set(override) | set(machine_defaults or {})) - set(DEFAULTS) - {"name", "$comment"}
         if unknown:
             raise ProjectError(f"{config_path}: unknown keys {sorted(unknown)}")
-        return cls(root, config, execution_mode)
+        cls._validate_tracker_config(config_path, config)
+        resolved_data = (data_dir or DEFAULT_DATA_DIR).expanduser()
+        return cls(root, config, execution_mode, resolved_data)
+
+    @staticmethod
+    def _validate_tracker_config(config_path: Path, config: dict) -> None:
+        if config["tracker"] not in TRACKERS:
+            raise ProjectError(f"{config_path}: tracker must be one of {', '.join(TRACKERS)}")
+        if config["delivery"] not in DELIVERY_MODES:
+            raise ProjectError(f"{config_path}: delivery must be one of {', '.join(DELIVERY_MODES)}")
+        github = config.get("github")
+        if not isinstance(github, dict):
+            raise ProjectError(f"{config_path}: github must be an object")
+        unknown_gh = set(github) - set(GITHUB_DEFAULTS)
+        if unknown_gh:
+            raise ProjectError(f"{config_path}: unknown github keys {sorted(unknown_gh)}")
+        if github["merge_method"] not in MERGE_METHODS:
+            raise ProjectError(f"{config_path}: github.merge_method must be one of {', '.join(MERGE_METHODS)}")
+        if github["auto_merge_fallback"] not in AUTO_MERGE_FALLBACKS:
+            raise ProjectError(f"{config_path}: github.auto_merge_fallback must be one of {', '.join(AUTO_MERGE_FALLBACKS)}")
 
     @property
     def name(self) -> str:
         return self.config["name"]
 
     @property
+    def tracker(self) -> str:
+        return self.config["tracker"]
+
+    @property
+    def is_github(self) -> bool:
+        return self.tracker == "github"
+
+    @property
+    def delivery_mode(self) -> str:
+        configured = self.config["delivery"]
+        if configured == "auto":
+            return "pr-automerge" if self.is_github else "local-ff"
+        return configured
+
+    @property
+    def require_owns(self) -> bool:
+        configured = self.config["require_owns"]
+        return (not self.is_github) if configured is None else bool(configured)
+
+    @property
+    def github_config(self) -> dict:
+        return self.config["github"]
+
+    def external_runs_dir(self) -> Path:
+        slug = re.sub(r"[^A-Za-z0-9._-]+", "-", self.name).strip("-") or "project"
+        digest = hashlib.sha1(str(self.root).lower().encode()).hexdigest()[:12]
+        return self.data_dir.expanduser() / "projects" / f"{slug}-{digest}" / "runs"
+
+    def _resolve_runs_dir(self) -> Path:
+        configured = str(self.config["runs_dir"])
+        if configured == "external":
+            return self.external_runs_dir()
+        expanded = Path(configured).expanduser()
+        return expanded if expanded.is_absolute() else self.root / expanded
+
+    @property
+    def is_external_ledger(self) -> bool:
+        return not self._resolve_runs_dir().resolve().is_relative_to(self.root.resolve())
+
+    @property
     def runs_dir(self) -> Path:
-        directory = self.root / self.config["runs_dir"]
+        directory = self._resolve_runs_dir()
         directory.mkdir(parents=True, exist_ok=True)
         return directory
 
@@ -305,18 +413,32 @@ class Project:
             return (self.root / configured).resolve()
         return self.root.parent / f"{self.root.name}-worktrees"
 
+    def _state_record(self, wp_id: str) -> dict:
+        path = self._resolve_runs_dir() / wp_id / "state.json"
+        if not path.is_file():
+            return {}
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
     def worktree(self, wp_id: str) -> Path:
         if self.execution_mode == "t3":
-            record = self.root / self.config["runs_dir"] / wp_id / "t3-workspace.json"
+            record = self._resolve_runs_dir() / wp_id / "t3-workspace.json"
             if record.is_file():
                 return Path(json.loads(record.read_text(encoding="utf-8"))["path"])
+        if bound := self._state_record(wp_id).get("worktree"):
+            return Path(bound)
         return self.worktrees_root / wp_id
 
     def branch(self, wp_id: str) -> str:
         if self.execution_mode == "t3":
-            record = self.root / self.config["runs_dir"] / wp_id / "t3-workspace.json"
+            record = self._resolve_runs_dir() / wp_id / "t3-workspace.json"
             if record.is_file():
                 return json.loads(record.read_text(encoding="utf-8"))["branch"]
+        if bound := self._state_record(wp_id).get("branch"):
+            return str(bound)
         return f"{self.config['branch_prefix']}{wp_id}"
 
     @property

@@ -47,8 +47,11 @@ DEFAULTS: dict = {
     "claude": "claude",
     "agy": "agy",
     "opencode": "opencode",
+    "gh": "gh",
     # Router catalog, cooldowns and other state shared by every project on this machine.
     "state_dir": "~/.local/state/wp-orchestration",
+    # Out-of-repo private ledger root for transcripts, logs and run state (`runs_dir: "external"`).
+    "data_dir": "~/.local/share/wp-orchestration",
     "reviewer_agent": "~/.config/wp-orchestration/reviewer.md",
     # Machine-wide preferences; project configuration takes precedence over both objects.
     "project_defaults": {},
@@ -172,6 +175,10 @@ class MachineConfig:
         directory = _expand(self.raw["state_dir"])
         directory.mkdir(parents=True, exist_ok=True)
         return directory
+
+    @property
+    def data_dir(self) -> Path:
+        return _expand(self.raw.get("data_dir", DEFAULTS["data_dir"]))
 
     @property
     def reviewer_agent(self) -> Path:
