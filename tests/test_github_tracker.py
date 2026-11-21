@@ -3832,14 +3832,32 @@ class Round3HardeningTests(unittest.TestCase):
             self.assertEqual(privacy.check_public_text("See /srv/home/alice/public"), [])
             self.assertEqual(privacy.check_public_text("See https://example.com/home/alice"), [])
 
-            # A60 + Windows 8.3 short-path sanitization/detection: short path aliases are stripped & checked.
-            with mock.patch("wpo.privacy._windows_short_path", return_value=r"C:\Users\RUNNER~1\AppData\Local\Temp\repo"):
+            # A60 + Windows 8.3 short-path sanitization/detection: full AND mixed-prefix short aliases are stripped & checked.
+            fake_root = base / "long-temp-dir" / "repo"
+            fake_root.mkdir(parents=True, exist_ok=True)
+            resolved_base = base.resolve()
+
+            def _fake_short(p: Path) -> str | None:
+                if p == resolved_base:
+                    return r"C:\Users\RUNNER~1\AppData\Local\Temp"
+                if p == fake_root.resolve():
+                    return r"C:\Users\RUNNER~1\AppData\Local\Temp\LONG-T~1\repo"
+                return None
+
+            with mock.patch("wpo.privacy._windows_short_path", side_effect=_fake_short):
                 self.assertEqual(
-                    privacy.sanitize_for_github(r"C:\Users\RUNNER~1\AppData\Local\Temp\repo/M1", base),
+                    privacy.sanitize_for_github(r"C:\Users\RUNNER~1\AppData\Local\Temp\long-temp-dir\repo/M1", fake_root),
                     "M1",
                 )
+                self.assertEqual(
+                    privacy.sanitize_for_github(r"C:\Users\RUNNER~1\AppData\Local\Temp\LONG-T~1\repo/Board", fake_root),
+                    "Board",
+                )
                 self.assertTrue(
-                    privacy.check_code_diff_text(r"leak=C:\Users\RUNNER~1\AppData\Local\Temp\repo\secret", project_root=base)
+                    privacy.check_code_diff_text(
+                        r"leak=C:\Users\RUNNER~1\AppData\Local\Temp\long-temp-dir\repo\secret",
+                        project_root=fake_root,
+                    )
                 )
 
             # A62: `ledger_writer` succeeds when machine `project_defaults` set `runs_dir` or `tracker`!

@@ -151,18 +151,34 @@ def _windows_short_path(path: Path) -> str | None:
 
 
 def _path_text_variants(path: Path) -> list[str]:
-    """All string representations of `path` (raw, resolved, POSIX, and Windows 8.3 short path)."""
+    """All string representations of `path` (raw, resolved, POSIX, full Windows 8.3 short path,
+    and mixed-prefix Windows 8.3 paths such as `%TEMP%\\<long-subdir>`)."""
     variants: set[str] = set()
-    for candidate in (path, path.resolve()):
-        for text in (str(candidate), candidate.as_posix()):
-            cleaned = text.rstrip("/\\")
+
+    def _add(text: str) -> None:
+        for form in (text, text.replace("\\", "/")):
+            cleaned = form.rstrip("/\\")
             if cleaned:
                 variants.add(cleaned)
+
+    resolved = path.resolve()
+    for candidate in (path, resolved):
+        _add(str(candidate))
+        _add(candidate.as_posix())
         if short := _windows_short_path(candidate):
-            for text in (short, short.replace("\\", "/")):
-                cleaned = text.rstrip("/\\")
-                if cleaned:
-                    variants.add(cleaned)
+            _add(short)
+    # Include mixed short-parent + long-suffix variants (e.g. `C:\Users\RUNNER~1\...\long-temp\repo`).
+    for parent in resolved.parents:
+        short_parent = _windows_short_path(parent)
+        if not short_parent:
+            continue
+        try:
+            rel = resolved.relative_to(parent)
+        except ValueError:
+            continue
+        if rel.parts:
+            sep = "\\" if "\\" in short_parent else "/"
+            _add(short_parent.rstrip("/\\") + sep + sep.join(rel.parts))
     return sorted(variants, key=len, reverse=True)
 
 
